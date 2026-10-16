@@ -7,8 +7,14 @@ package org.whispersystems.textsecuregcm.controllers;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -21,6 +27,7 @@ import jakarta.ws.rs.client.Invocation;
 import jakarta.ws.rs.core.Response;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -40,6 +47,9 @@ import org.whispersystems.textsecuregcm.asn.AsnInfo;
 import org.whispersystems.textsecuregcm.asn.AsnInfoProvider;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.TellomiFeedTokens;
+import org.whispersystems.textsecuregcm.limits.RateLimiter;
+import org.whispersystems.textsecuregcm.limits.RateLimiters;
+import org.whispersystems.textsecuregcm.mappers.RateLimitExceededExceptionMapper;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.tests.util.AuthHelper;
@@ -58,20 +68,26 @@ class TellomiFeedControllerTest {
   private static final AccountsManager accountsManager = mock(AccountsManager.class);
   private static final AsnInfoProvider asnInfoProvider = mock(AsnInfoProvider.class);
   private static final Account account = mock(Account.class);
+  private static final RateLimiters rateLimiters = mock(RateLimiters.class);
+  private static final RateLimiter friendLimiter = mock(RateLimiter.class);
+  private static final RateLimiter audienceLimiter = mock(RateLimiter.class);
 
   private static final ResourceExtension resources = ResourceExtension.builder()
       .addProvider(AuthHelper.getAuthFilter())
       .addProvider(new TestRemoteAddressFilterProvider("1.2.3.4"))
+      .addProvider(new RateLimitExceededExceptionMapper())
       .addProvider(new AuthValueFactoryProvider.Binder<>(AuthenticatedDevice.class))
       .setMapper(SystemMapper.jsonMapper())
       .setTestContainerFactory(new GrizzlyWebTestContainerFactory())
-      .addResource(new TellomiFeedController(accountsManager, TOKENS, List.of("tellomi.cn"), () -> asnInfoProvider,
+      .addResource(new TellomiFeedController(accountsManager, rateLimiters, TOKENS, List.of("tellomi.cn"), () -> asnInfoProvider,
           Clock.fixed(NOW, ZoneOffset.UTC)))
       .build();
 
   @BeforeEach
   void setUp() {
-    reset(accountsManager, asnInfoProvider, account);
+    reset(accountsManager, asnInfoProvider, account, rateLimiters, friendLimiter, audienceLimiter);
+    when(rateLimiters.getTellomiFeedFriendAssertionLimiter()).thenReturn(friendLimiter);
+    when(rateLimiters.getTellomiFeedAudienceListLimiter()).thenReturn(audienceLimiter);
     when(account.getNumber()).thenReturn(Optional.of("+14150000000"));
     when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID)).thenReturn(Optional.of(account));
     when(asnInfoProvider.lookup(any())).thenReturn(Optional.empty());
@@ -244,5 +260,110 @@ class TellomiFeedControllerTest {
         .post(Entity.json(Map.of("kind", "include", "peer_acis", List.of(AuthHelper.VALID_UUID.toString()))))) {
       assertThat(response.getStatus()).isEqualTo(400);
     }
+  }
+
+  // ---- B-9: rate limiting of friend assertions and audience lists ----
+
+  @Test
+  void addFriendSpendsOnePermitKeyedByCallerAci() throws Exception {
+    final UUID peer = UUID.randomUUID();
+    when(accountsManager.getByAccountIdentifier(peer)).thenReturn(Optional.of(mock(Account.class)));
+
+    try (final Response response = request("/v1/tellomi/feed/friend-assertions")
+        .post(Entity.json(Map.of("peer_aci", peer.toString())))) {
+      assertThat(response.getStatus()).isEqualTo(200);
+    }
+    verify(friendLimiter, times(1)).validate(AuthHelper.VALID_UUID);
+    verifyNoInteractions(audienceLimiter);
+  }
+
+  @Test
+  void addFriendRateLimitedIsTooManyRequestsAndLeaksNothing() throws Exception {
+    doThrow(new RateLimitExceededException(Duration.ofSeconds(42))).when(friendLimiter).validate(any(UUID.class));
+    final UUID existing = UUID.randomUUID();
+    when(accountsManager.getByAccountIdentifier(existing)).thenReturn(Optional.of(mock(Account.class)));
+
+    // An existing and a non-existing peer must be indistinguishable once the limit is hit
+    // (the whole point of the limit: the 200 / 404 difference is an account-existence oracle).
+    for (final UUID peer : List.of(existing, UUID.randomUUID())) {
+      try (final Response response = request("/v1/tellomi/feed/friend-assertions")
+          .post(Entity.json(Map.of("peer_aci", peer.toString())))) {
+        assertThat(response.getStatus()).isEqualTo(429);
+        assertThat(response.getHeaderString("Retry-After")).isEqualTo("42");
+        assertThat(response.hasEntity() ? response.readEntity(String.class) : "").doesNotContain("assertion");
+      }
+    }
+    // No account lookup happened for either: the limiter runs before the existence check.
+    verifyNoInteractions(accountsManager);
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"not-a-uuid", "1-1-1-1-1"})
+  void malformedFriendRequestsStillCostAPermit(final String peer) throws Exception {
+    try (final Response response = request("/v1/tellomi/feed/friend-assertions")
+        .post(Entity.json(Map.of("peer_aci", peer)))) {
+      assertThat(response.getStatus()).isEqualTo(400);
+    }
+    verify(friendLimiter, times(1)).validate(AuthHelper.VALID_UUID);
+  }
+
+  @Test
+  void selfFriendRequestStillCostsAPermit() throws Exception {
+    try (final Response response = request("/v1/tellomi/feed/friend-assertions")
+        .post(Entity.json(Map.of("peer_aci", AuthHelper.VALID_UUID.toString())))) {
+      assertThat(response.getStatus()).isEqualTo(400);
+    }
+    verify(friendLimiter, times(1)).validate(AuthHelper.VALID_UUID);
+  }
+
+  @Test
+  void removeFriendIsNotRateLimited() throws Exception {
+    // No account lookup, so no existence oracle: deliberately outside the limiter (decision recorded in the B-9 notes).
+    try (final Response response = request("/v1/tellomi/feed/friend-assertions/" + UUID.randomUUID()).delete()) {
+      assertThat(response.getStatus()).isEqualTo(200);
+    }
+    verifyNoInteractions(friendLimiter, audienceLimiter);
+  }
+
+  @Test
+  void audienceListSpendsOnePermitKeyedByCallerAci() throws Exception {
+    try (final Response response = request("/v1/tellomi/feed/audience-lists")
+        .post(Entity.json(Map.of("kind", "include", "peer_acis", List.of(UUID.randomUUID().toString()))))) {
+      assertThat(response.getStatus()).isEqualTo(200);
+    }
+    verify(audienceLimiter, times(1)).validate(AuthHelper.VALID_UUID);
+    verifyNoInteractions(friendLimiter);
+  }
+
+  @Test
+  void audienceListRateLimitedIsTooManyRequestsWithoutASignature() throws Exception {
+    doThrow(new RateLimitExceededException(Duration.ofSeconds(7))).when(audienceLimiter).validate(any(UUID.class));
+
+    try (final Response response = request("/v1/tellomi/feed/audience-lists")
+        .post(Entity.json(Map.of("kind", "include", "peer_acis", List.of(UUID.randomUUID().toString()))))) {
+      assertThat(response.getStatus()).isEqualTo(429);
+      assertThat(response.getHeaderString("Retry-After")).isEqualTo("7");
+      assertThat(response.hasEntity() ? response.readEntity(String.class) : "").doesNotContain("audience_token");
+    }
+  }
+
+  @Test
+  void audienceListBodyValidationRunsBeforeTheLimiter() throws Exception {
+    // Bean validation (422) is done by Jersey before the method body, so oversized / empty lists do not spend a permit.
+    try (final Response response = request("/v1/tellomi/feed/audience-lists")
+        .post(Entity.json(Map.of("kind", "everyone", "peer_acis", List.of(UUID.randomUUID().toString()))))) {
+      assertThat(response.getStatus()).isEqualTo(422);
+    }
+    verify(audienceLimiter, never()).validate(anyString());
+    verify(audienceLimiter, never()).validate(any(UUID.class));
+  }
+
+  @Test
+  void credentialIsNotRateLimitedByTheFeedLimiters() throws Exception {
+    // /auth is a cheap HMAC with no existence oracle; it is intentionally not covered by B-9 (see notes).
+    try (final Response response = request("/v1/tellomi/feed/auth").get()) {
+      assertThat(response.getStatus()).isEqualTo(200);
+    }
+    verifyNoInteractions(friendLimiter, audienceLimiter);
   }
 }

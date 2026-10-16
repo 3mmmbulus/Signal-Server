@@ -5,10 +5,13 @@
 
 package org.whispersystems.textsecuregcm.controllers;
 
+import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
+
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.net.HttpHeaders;
 import io.dropwizard.auth.Auth;
+import io.micrometer.core.instrument.Metrics;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
@@ -42,13 +45,17 @@ import java.util.Locale;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import javax.annotation.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.asn.AsnInfo;
 import org.whispersystems.textsecuregcm.asn.AsnInfoProvider;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.TellomiFeedTokens;
 import org.whispersystems.textsecuregcm.filters.RemoteAddressFilter;
+import org.whispersystems.textsecuregcm.limits.RateLimiters;
 import org.whispersystems.textsecuregcm.storage.Account;
 import org.whispersystems.textsecuregcm.storage.AccountsManager;
 import org.whispersystems.textsecuregcm.util.Util;
@@ -78,22 +85,34 @@ public class TellomiFeedController {
   static final String REGION_CN = "cn";
   static final String REGION_GLOBAL = "global";
 
+  private static final Logger log = LoggerFactory.getLogger(TellomiFeedController.class);
+  private static final String REGION_COUNTER_NAME = name(TellomiFeedController.class, "region");
+  private static final String ASN_TABLE_EMPTY_COUNTER_NAME = name(TellomiFeedController.class, "asnTableEmpty");
+  private static final String VIA_NUMBER = "number";
+  private static final String VIA_HOST = "host";
+  private static final String VIA_ASN = "asn";
+  private static final String VIA_DEFAULT = "default";
+
   private static final String CN_COUNTRY_CODE = "86";
   private static final String X_FORWARDED_HOST = "X-Forwarded-Host";
 
   private final AccountsManager accountsManager;
+  private final RateLimiters rateLimiters;
   private final TellomiFeedTokens tokens;
   private final List<String> cnHostSuffixes;
   private final Supplier<AsnInfoProvider> asnInfoProviderSupplier;
   private final Clock clock;
+  private final AtomicBoolean asnTableEmptyLogged = new AtomicBoolean();
 
   public TellomiFeedController(final AccountsManager accountsManager,
+      final RateLimiters rateLimiters,
       final TellomiFeedTokens tokens,
       final List<String> cnHostSuffixes,
       final Supplier<AsnInfoProvider> asnInfoProviderSupplier,
       final Clock clock) {
 
     this.accountsManager = accountsManager;
+    this.rateLimiters = rateLimiters;
     this.tokens = tokens;
     this.cnHostSuffixes = List.copyOf(cnHostSuffixes);
     this.asnInfoProviderSupplier = asnInfoProviderSupplier;
@@ -151,8 +170,12 @@ public class TellomiFeedController {
   @ApiResponse(responseCode = "200", description = "The signed assertion", useReturnTypeSchema = true)
   @ApiResponse(responseCode = "400", description = "`peer_aci` is not an ACI, or is the caller")
   @ApiResponse(responseCode = "404", description = "No account has that ACI")
+  @ApiResponse(responseCode = "429", description = "Too many friend assertions from this account")
   public FriendAssertion addFriend(@Auth final AuthenticatedDevice auth,
-      @NotNull @Valid final FriendAssertionRequest request) {
+      @NotNull @Valid final FriendAssertionRequest request) throws RateLimitExceededException {
+
+    // 先限流、再解析和查账号：这个接口的 404 / 200 能让人探测某个 ACI 有没有账号（PR #13 的欠账），格式错的请求也占一个名额
+    rateLimiters.getTellomiFeedFriendAssertionLimiter().validate(auth.accountIdentifier());
 
     final UUID peer = peer(auth, request.peerAci());
     if (accountsManager.getByAccountIdentifier(peer).isEmpty()) {
@@ -189,8 +212,11 @@ public class TellomiFeedController {
   @ApiResponse(responseCode = "200", description = "The signed list", useReturnTypeSchema = true)
   @ApiResponse(responseCode = "400", description = "An entry is not an ACI, or no one is left besides the caller")
   @ApiResponse(responseCode = "422", description = "Bad `kind`, or the list is empty or too long")
+  @ApiResponse(responseCode = "429", description = "Too many audience lists from this account")
   public AudienceList signAudienceList(@Auth final AuthenticatedDevice auth,
-      @NotNull @Valid final AudienceListRequest request) {
+      @NotNull @Valid final AudienceListRequest request) throws RateLimitExceededException {
+
+    rateLimiters.getTellomiFeedAudienceListLimiter().validate(auth.accountIdentifier());
 
     final Set<UUID> members = new LinkedHashSet<>();
     for (final String aci : request.peerAcis()) {
@@ -207,21 +233,42 @@ public class TellomiFeedController {
   /// 内容区域（ADR-0071 §5.3「取严」）：+86 号码 → cn；否则经大陆入口（`tellomi.cn` 主机）或大陆 IP 进来 → cn；都不是才 global
   @VisibleForTesting
   String region(final Account account, final ContainerRequestContext requestContext) {
+    final String via;
     if (account.getNumber().map(Util::getCountryCode).filter(CN_COUNTRY_CODE::equals).isPresent()) {
-      return REGION_CN;
-    }
-    if (isCnHost(requestContext.getHeaderString(HttpHeaders.HOST))
+      via = VIA_NUMBER;
+    } else if (isCnHost(requestContext.getHeaderString(HttpHeaders.HOST))
         || isCnHost(requestContext.getHeaderString(X_FORWARDED_HOST))) {
-      return REGION_CN;
+      via = VIA_HOST;
+    } else if (isCnAddress((String) requestContext.getProperty(RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME))) {
+      via = VIA_ASN;
+    } else {
+      via = VIA_DEFAULT;
     }
-    final String remoteAddress = (String) requestContext.getProperty(RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME);
-    if (remoteAddress != null && asnInfoProviderSupplier.get().lookup(remoteAddress)
+    final String region = VIA_DEFAULT.equals(via) ? REGION_GLOBAL : REGION_CN;
+    Metrics.counter(REGION_COUNTER_NAME, "region", region, "via", via).increment();
+    return region;
+  }
+
+  /// ASN 表判定的大陆 IP。表是 S3 上的 iptoasn TSV，由 `asnTable` 配置的监视器载入；还没载入（或载入失败）时提供者是
+  /// `AsnInfoProvider.EMPTY`，这一项就永远判不出 CN（PR #13 的欠账）。这里不改行为，只把它变成看得见的：计数器
+  /// `asnTableEmpty` 每次走到这一步且表是空的就加一，第一次还写一条 WARN。
+  private boolean isCnAddress(@Nullable final String remoteAddress) {
+    if (remoteAddress == null) {
+      return false;
+    }
+    final AsnInfoProvider provider = asnInfoProviderSupplier.get();
+    if (provider == AsnInfoProvider.EMPTY) {
+      Metrics.counter(ASN_TABLE_EMPTY_COUNTER_NAME).increment();
+      if (asnTableEmptyLogged.compareAndSet(false, true)) {
+        log.warn("Tellomi feed: the ASN table is empty (not loaded yet, or its S3 object failed to load); "
+            + "mainland IP detection is inactive, only +86 numbers and mainland entry hosts select region cn");
+      }
+      return false;
+    }
+    return provider.lookup(remoteAddress)
         .map(AsnInfo::regionCode)
         .filter("CN"::equalsIgnoreCase)
-        .isPresent()) {
-      return REGION_CN;
-    }
-    return REGION_GLOBAL;
+        .isPresent();
   }
 
   private boolean isCnHost(@Nullable final String hostHeader) {

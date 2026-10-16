@@ -1418,7 +1418,7 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
     // Tellomi（ADR-0071 §5.3）：动态的内容引擎凭证、好友声明、受众名单。和别的已鉴权接口一样，HTTP 和 WebSocket 都注册
     final TellomiFeedConfiguration tellomiFeedConfig = config.getTellomiFeedConfiguration();
     if (tellomiFeedConfig != null) {
-      final TellomiFeedController tellomiFeedController = new TellomiFeedController(accountsManager,
+      final TellomiFeedController tellomiFeedController = new TellomiFeedController(accountsManager, rateLimiters,
           new TellomiFeedTokens(tellomiFeedConfig.signingKey().value(), tellomiFeedConfig.pseudonymKey().value()),
           tellomiFeedConfig.cnHostSuffixes(), asnInfoProviderSupplier, clock);
       environment.jersey().register(tellomiFeedController);

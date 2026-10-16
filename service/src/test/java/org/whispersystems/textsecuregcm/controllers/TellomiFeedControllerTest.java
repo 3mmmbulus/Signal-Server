@@ -83,6 +83,19 @@ class TellomiFeedControllerTest {
           Clock.fixed(NOW, ZoneOffset.UTC)))
       .build();
 
+  /// A clock with sub-second precision, as `Clock.systemUTC()` has in production.
+  private static final Instant NOW_WITH_NANOS = NOW.plusNanos(654_809_212L);
+
+  private static final ResourceExtension resourcesWithNanos = ResourceExtension.builder()
+      .addProvider(AuthHelper.getAuthFilter())
+      .addProvider(new TestRemoteAddressFilterProvider("1.2.3.4"))
+      .addProvider(new AuthValueFactoryProvider.Binder<>(AuthenticatedDevice.class))
+      .setMapper(SystemMapper.jsonMapper())
+      .setTestContainerFactory(new GrizzlyWebTestContainerFactory())
+      .addResource(new TellomiFeedController(accountsManager, rateLimiters, TOKENS, List.of("tellomi.cn"), () -> asnInfoProvider,
+          Clock.fixed(NOW_WITH_NANOS, ZoneOffset.UTC)))
+      .build();
+
   @BeforeEach
   void setUp() {
     reset(accountsManager, asnInfoProvider, account, rateLimiters, friendLimiter, audienceLimiter);
@@ -121,6 +134,19 @@ class TellomiFeedControllerTest {
     assertThat(claims.get("sub").asText()).isEqualTo(sub(AuthHelper.VALID_UUID));
     assertThat(claims.get("rgn").asText()).isEqualTo("global");
     assertThat(claims.get("exp").asLong()).isEqualTo(NOW.plusSeconds(3600).getEpochSecond());
+  }
+
+  @Test
+  void expiresAtIsWholeSecondsAndMatchesExp() throws Exception {
+    final JsonNode body = MAPPER.readTree(resourcesWithNanos.getJerseyTest().target("/v1/tellomi/feed/auth").request()
+        .header("Authorization", AuthHelper.getAuthHeader(AuthHelper.VALID_UUID, AuthHelper.VALID_PASSWORD))
+        .get(String.class));
+
+    // the contract's example shape: no fractional seconds
+    assertThat(body.get("expires_at").asText()).isEqualTo("2026-10-13T13:00:00Z");
+    // and it names the same instant as the token's exp
+    assertThat(Instant.parse(body.get("expires_at").asText()).getEpochSecond())
+        .isEqualTo(claims(body.get("token").asText()).get("exp").asLong());
   }
 
   @Test

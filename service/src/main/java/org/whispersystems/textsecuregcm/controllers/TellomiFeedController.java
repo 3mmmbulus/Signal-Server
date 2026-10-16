@@ -31,6 +31,7 @@ import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
 import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.ServiceUnavailableException;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.Context;
@@ -84,6 +85,10 @@ public class TellomiFeedController {
   /// 引擎 `MaxAudienceMembers`
   public static final int MAX_AUDIENCE_MEMBERS = 500;
 
+  /// 限流存储（Redis）不可用、限流器 fail closed 时给客户端的 `Retry-After`（秒）。
+  @VisibleForTesting
+  static final long LIMITER_UNAVAILABLE_RETRY_AFTER_SECONDS = 30;
+
   static final String REGION_CN = "cn";
   static final String REGION_GLOBAL = "global";
 
@@ -91,6 +96,7 @@ public class TellomiFeedController {
   private static final String REGION_COUNTER_NAME = name(TellomiFeedController.class, "region");
   private static final String ASN_TABLE_EMPTY_COUNTER_NAME = name(TellomiFeedController.class, "asnTableEmpty");
   private static final String DEGRADED_LIMIT_COUNTER_NAME = name(TellomiFeedController.class, "degradedIpLimit");
+  private static final String LIMITER_UNAVAILABLE_COUNTER_NAME = name(TellomiFeedController.class, "limiterUnavailable");
   private static final String UNKNOWN_REMOTE_ADDRESS = "unknown";
   private static final String VIA_NUMBER = "number";
   private static final String VIA_HOST = "host";
@@ -178,6 +184,7 @@ public class TellomiFeedController {
   @ApiResponse(responseCode = "400", description = "`peer_aci` is not an ACI, or is the caller")
   @ApiResponse(responseCode = "404", description = "No account has that ACI")
   @ApiResponse(responseCode = "429", description = "Too many friend assertions from this account (or, while the ASN table is empty, from this address)")
+  @ApiResponse(responseCode = "503", description = "The rate limiter's store is unavailable; nothing was signed. Retry-After says when to retry")
   public FriendAssertion addFriend(@Auth final AuthenticatedDevice auth,
       @NotNull @Valid final FriendAssertionRequest request,
       @Context final ContainerRequestContext requestContext) throws RateLimitExceededException {
@@ -185,7 +192,7 @@ public class TellomiFeedController {
     // 先限流、再解析和查账号：这个接口的 404 / 200 能让人探测某个 ACI 有没有账号（PR #13 的欠账），格式错的请求也占一个名额。
     // ASN 表是空的时候多限一层按来源 IP 的（见 validateIpWhileAsnTableIsEmpty）
     validateIpWhileAsnTableIsEmpty("friendAssertion", rateLimiters::getTellomiFeedFriendAssertionIpLimiter, requestContext);
-    rateLimiters.getTellomiFeedFriendAssertionLimiter().validate(auth.accountIdentifier());
+    validateAccount("friendAssertion", rateLimiters.getTellomiFeedFriendAssertionLimiter(), auth.accountIdentifier());
 
     final UUID peer = peer(auth, request.peerAci());
     if (accountsManager.getByAccountIdentifier(peer).isEmpty()) {
@@ -223,12 +230,13 @@ public class TellomiFeedController {
   @ApiResponse(responseCode = "400", description = "An entry is not an ACI, or no one is left besides the caller")
   @ApiResponse(responseCode = "422", description = "Bad `kind`, or the list is empty or too long")
   @ApiResponse(responseCode = "429", description = "Too many audience lists from this account (or, while the ASN table is empty, from this address)")
+  @ApiResponse(responseCode = "503", description = "The rate limiter's store is unavailable; nothing was signed. Retry-After says when to retry")
   public AudienceList signAudienceList(@Auth final AuthenticatedDevice auth,
       @NotNull @Valid final AudienceListRequest request,
       @Context final ContainerRequestContext requestContext) throws RateLimitExceededException {
 
     validateIpWhileAsnTableIsEmpty("audienceList", rateLimiters::getTellomiFeedAudienceListIpLimiter, requestContext);
-    rateLimiters.getTellomiFeedAudienceListLimiter().validate(auth.accountIdentifier());
+    validateAccount("audienceList", rateLimiters.getTellomiFeedAudienceListLimiter(), auth.accountIdentifier());
 
     final Set<UUID> members = new LinkedHashSet<>();
     for (final String aci : request.peerAcis()) {
@@ -303,7 +311,33 @@ public class TellomiFeedController {
     noteAsnTableEmpty();
     Metrics.counter(DEGRADED_LIMIT_COUNTER_NAME, "endpoint", endpoint).increment();
     final String remoteAddress = (String) requestContext.getProperty(RemoteAddressFilter.REMOTE_ADDRESS_ATTRIBUTE_NAME);
-    ipLimiter.get().validate(remoteAddress == null ? UNKNOWN_REMOTE_ADDRESS : remoteAddress);
+    final String key = remoteAddress == null ? UNKNOWN_REMOTE_ADDRESS : remoteAddress;
+    failClosedAsUnavailable(endpoint, () -> ipLimiter.get().validate(key));
+  }
+
+  private void validateAccount(final String endpoint, final RateLimiter limiter, final UUID accountIdentifier)
+      throws RateLimitExceededException {
+
+    failClosedAsUnavailable(endpoint, () -> limiter.validate(accountIdentifier));
+  }
+
+  @FunctionalInterface
+  private interface LimiterCall {
+    void run() throws RateLimitExceededException;
+  }
+
+  /// 限流器自己出错（Redis 不可用；`failOpen = false` 的限流器会把存储抛出的运行时异常原样抛出来）：仍然拒绝（不签名、
+  /// 不查账号），但回 503 + `Retry-After`，而不是一个没有任何线索的 500。真的超限（`RateLimitExceededException`）照旧是 429。
+  private void failClosedAsUnavailable(final String endpoint, final LimiterCall call) throws RateLimitExceededException {
+    try {
+      call.run();
+    } catch (final RateLimitExceededException e) {
+      throw e;
+    } catch (final RuntimeException e) {
+      log.warn("Tellomi feed: rate limiter for {} failed, answering 503", endpoint, e);
+      Metrics.counter(LIMITER_UNAVAILABLE_COUNTER_NAME, "endpoint", endpoint).increment();
+      throw new ServiceUnavailableException(LIMITER_UNAVAILABLE_RETRY_AFTER_SECONDS);
+    }
   }
 
   private boolean isCnHost(@Nullable final String hostHeader) {

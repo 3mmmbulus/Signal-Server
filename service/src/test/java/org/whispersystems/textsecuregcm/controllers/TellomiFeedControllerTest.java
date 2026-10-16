@@ -218,6 +218,52 @@ class TellomiFeedControllerTest {
     }
   }
 
+  /// The 404 of a missing account carries a marker so a client can tell it from the 404 of a server that does not
+  /// have the route at all (no `tellomiFeed:` config): `Content-Type: application/json`, body exactly
+  /// `{"error":"account_not_found"}`. Spec: draft-workflows/FRIEND-ASSERTION-404-MARKER.md.
+  @Test
+  void addFriendUnknownPeerCarriesTheAccountNotFoundMarker() throws Exception {
+    try (final Response response = request("/v1/tellomi/feed/friend-assertions")
+        .post(Entity.json(Map.of("peer_aci", UUID.randomUUID().toString())))) {
+      assertThat(response.getStatus()).isEqualTo(404);
+      assertThat(response.getMediaType().getType()).isEqualTo("application");
+      assertThat(response.getMediaType().getSubtype()).isEqualTo("json");
+      final JsonNode body = MAPPER.readTree(response.readEntity(String.class));
+      assertThat(body.size()).isEqualTo(1);
+      assertThat(body.get("error").asText()).isEqualTo("account_not_found");
+    }
+  }
+
+  /// Control: the marker is only for the missing account. Other statuses stay as they were (and have no marker).
+  @Test
+  void otherFriendAssertionStatusesDoNotCarryTheMarker() {
+    try (final Response bad = request("/v1/tellomi/feed/friend-assertions")
+        .post(Entity.json(Map.of("peer_aci", "not-a-uuid")))) {
+      assertThat(bad.getStatus()).isEqualTo(400);
+      assertThat(bad.readEntity(String.class)).doesNotContain("account_not_found");
+    }
+    final UUID peer = UUID.randomUUID();
+    when(accountsManager.getByAccountIdentifier(peer)).thenReturn(Optional.of(mock(Account.class)));
+    try (final Response ok = request("/v1/tellomi/feed/friend-assertions")
+        .post(Entity.json(Map.of("peer_aci", peer.toString())))) {
+      assertThat(ok.getStatus()).isEqualTo(200);
+      assertThat(ok.readEntity(String.class)).doesNotContain("account_not_found");
+    }
+  }
+
+  /// Same question for the audience-list route: it never looks accounts up, so it never answers 404 itself. An
+  /// ACI that has no account is signed like any other, which means a 404 from that route can only mean "no route"
+  /// and needs no marker.
+  @Test
+  void audienceListNeverAnswersNotFoundForAnUnknownAccount() {
+    when(accountsManager.getByAccountIdentifier(any(UUID.class))).thenReturn(Optional.empty());
+    when(accountsManager.getByAccountIdentifier(AuthHelper.VALID_UUID)).thenReturn(Optional.of(account));
+    try (final Response response = request("/v1/tellomi/feed/audience-lists")
+        .post(Entity.json(Map.of("kind", "include", "peer_acis", List.of(UUID.randomUUID().toString()))))) {
+      assertThat(response.getStatus()).isEqualTo(200);
+    }
+  }
+
   @ParameterizedTest
   @ValueSource(strings = {"not-a-uuid", "1-1-1-1-1", ""})
   void addFriendBadPeer(final String peer) {

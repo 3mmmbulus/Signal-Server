@@ -36,14 +36,41 @@ public class InMemoryEngineDeletionOutbox implements EngineDeletionOutbox {
   @Override
   public synchronized boolean enqueue(final byte[] sub, final Instant now) {
     final String k = key(sub);
-    if (pending.containsKey(k) || dead.containsKey(k)) {
+    final Entry existing = pending.get(k);
+    if (existing != null && existing.kind() == Kind.SWEEP) {
+      // a new account deletion for the same pseudonym (the ACI was recycled and deleted again): delete now
+      pending.put(k, new Entry(UUID.randomUUID(), Kind.DELETE, existing.sub(), 0, now, now, "none"));
+      return true;
+    }
+    if (existing != null || dead.containsKey(k)) {
       return true;
     }
     if (pending.size() >= maxPending) {
       return false;
     }
-    pending.put(k, new Entry(UUID.randomUUID(), sub.clone(), 0, now, now, "none"));
+    pending.put(k, new Entry(UUID.randomUUID(), Kind.DELETE, sub.clone(), 0, now, now, "none"));
     return true;
+  }
+
+  @Override
+  public synchronized boolean enqueueSweep(final byte[] sub, final Instant dueAt, final Instant enqueuedAt) {
+    final String k = key(sub);
+    if (pending.containsKey(k) || dead.containsKey(k) || pending.size() >= maxPending) {
+      return false;
+    }
+    pending.put(k, new Entry(UUID.randomUUID(), Kind.SWEEP, sub.clone(), 0, dueAt, enqueuedAt, "none"));
+    return true;
+  }
+
+  @Override
+  public synchronized boolean cancelSweep(final byte[] sub) {
+    final String k = key(sub);
+    final Entry existing = pending.get(k);
+    if (existing != null && existing.kind() == Kind.SWEEP) {
+      pending.remove(k);
+      return true;
+    }
+    return false;
   }
 
   @Override
@@ -66,7 +93,7 @@ public class InMemoryEngineDeletionOutbox implements EngineDeletionOutbox {
     for (final Map.Entry<String, Entry> me : pending.entrySet()) {
       final Entry e = me.getValue();
       if (e.entryId().equals(entryId)) {
-        me.setValue(new Entry(e.entryId(), e.sub(), attempts, nextAttemptAt, e.enqueuedAt(), lastOutcome));
+        me.setValue(new Entry(e.entryId(), e.kind(), e.sub(), attempts, nextAttemptAt, e.enqueuedAt(), lastOutcome));
         return;
       }
     }
@@ -81,7 +108,7 @@ public class InMemoryEngineDeletionOutbox implements EngineDeletionOutbox {
         if (dead.size() >= MAX_DEAD_LETTERS) {
           dead.remove(dead.keySet().iterator().next());
         }
-        dead.put(me.getKey(), new Entry(e.entryId(), e.sub(), attempts, e.nextAttemptAt(), e.enqueuedAt(), lastOutcome));
+        dead.put(me.getKey(), new Entry(e.entryId(), e.kind(), e.sub(), attempts, e.nextAttemptAt(), e.enqueuedAt(), lastOutcome));
         return;
       }
     }
@@ -111,7 +138,7 @@ public class InMemoryEngineDeletionOutbox implements EngineDeletionOutbox {
       }
       final Entry e = me.getValue();
       dead.remove(me.getKey());
-      pending.put(me.getKey(), new Entry(e.entryId(), e.sub(), 0, now, e.enqueuedAt(), e.lastOutcome()));
+      pending.put(me.getKey(), new Entry(e.entryId(), e.kind(), e.sub(), 0, now, e.enqueuedAt(), e.lastOutcome()));
       moved++;
     }
     return moved;

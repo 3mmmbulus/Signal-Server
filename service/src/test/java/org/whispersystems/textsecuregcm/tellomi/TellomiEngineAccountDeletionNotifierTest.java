@@ -357,4 +357,228 @@ class TellomiEngineAccountDeletionNotifierTest {
     assertThat(text).doesNotContain("engine.example.invalid").doesNotContain("/internal/users").doesNotContain("Bearer");
     assertThat(text).doesNotContain(Arrays.toString(sub));
   }
+
+  // ---------------------------------------------------------------- second delete (sweep)
+
+  private static final Duration SECOND_DELETE = Duration.ofMinutes(70);
+
+  private final TellomiEngineDeletionConfiguration sweepConfig = TellomiEngineDeletionTestSupport.enabled(
+      "https://engine.example.invalid", Duration.ofSeconds(2), 4, true, SECOND_DELETE);
+
+  private TellomiEngineAccountDeletionNotifier sweepNotifier() {
+    return notifier(sweepConfig, TOKENS::pseudonym, outbox);
+  }
+
+  @Test
+  void aSecondDeleteFollowsTheFirstSeventyMinutesAfterTheAccountDeletion() {
+    final TellomiEngineAccountDeletionNotifier n = sweepNotifier();
+    final UUID aci = UUID.randomUUID();
+    n.onAccountDeleted(aci);
+    clock.advance(Duration.ofSeconds(1));
+
+    n.drain(); // first delete: 200
+    assertThat(sent).hasSize(1);
+    assertThat(outbox.pendingCount()).as("the second delete is queued").isEqualTo(1);
+    assertThat(outbox.due(clock.instant(), 10)).isEmpty();
+
+    clock.advance(SECOND_DELETE.minusSeconds(2)); // 69 min 59 s after the deletion... 1 s still to go
+    assertThat(n.drain()).isZero();
+    assertThat(sent).hasSize(1);
+
+    clock.advance(Duration.ofSeconds(1)); // exactly deletedAt + 70 min
+    assertThat(n.drain()).isEqualTo(1);
+    assertThat(sent).hasSize(2);
+    assertThat(sent.get(1)).as("the same pseudonym").isEqualTo(TOKENS.pseudonym(aci));
+    assertThat(outbox.pendingCount()).as("a sweep never schedules another").isZero();
+    assertThat(outbox.deadLetterCount()).isZero();
+
+    clock.advance(Duration.ofDays(2));
+    assertThat(n.drain()).isZero();
+    assertThat(sent).hasSize(2);
+  }
+
+  @Test
+  void noSecondDeleteWhenTheDelayIsZero() {
+    final TellomiEngineAccountDeletionNotifier n = notifier(); // sweep off in this config
+    n.onAccountDeleted(UUID.randomUUID());
+    n.drain();
+    assertThat(outbox.pendingCount()).isZero();
+    clock.advance(Duration.ofDays(1));
+    n.drain();
+    assertThat(sent).hasSize(1);
+  }
+
+  @Test
+  void noSecondDeleteWhenTheFirstOneWasDeadLettered() {
+    final TellomiEngineAccountDeletionNotifier n = sweepNotifier();
+    n.onAccountDeleted(UUID.randomUUID());
+    script.add(r(Outcome.PERMANENT, 400));
+    n.drain();
+    assertThat(outbox.pendingCount()).isZero();
+    assertThat(outbox.deadLetterCount()).isEqualTo(1);
+    clock.advance(Duration.ofDays(1));
+    n.drain();
+    assertThat(sent).hasSize(1);
+  }
+
+  @Test
+  void theSecondDeleteIsDueAtOnceWhenTheFirstOneTookLongerThanTheDelay() {
+    final TellomiEngineAccountDeletionNotifier n = sweepNotifier();
+    n.onAccountDeleted(UUID.randomUUID());
+    script.add(r(Outcome.RETRY, 503));
+    n.drain();                                 // engine down at the start
+    clock.advance(Duration.ofMinutes(80));     // ... and back much later
+    n.drain();                                 // first delete succeeds
+    assertThat(sent).hasSize(2);
+    assertThat(n.drain()).as("sweep is already due").isEqualTo(1);
+    assertThat(sent).hasSize(3);
+    assertThat(outbox.pendingCount()).isZero();
+  }
+
+  @Test
+  void theSecondDeleteIsRetriedLikeTheFirstAndEndsInTheDeadLetterBox() {
+    final TellomiEngineAccountDeletionNotifier n = sweepNotifier();
+    n.onAccountDeleted(UUID.randomUUID());
+    n.drain();
+    clock.advance(SECOND_DELETE);
+    for (int i = 0; i < 4; i++) {
+      script.add(r(Outcome.RETRY, 503));
+    }
+    for (int i = 0; i < 10; i++) {
+      n.drain();
+      clock.advance(Duration.ofMinutes(5));
+    }
+    assertThat(sent).as("1 first delete + exactly maxAttempts (4) tries of the second").hasSize(5);
+    assertThat(outbox.deadLetterCount()).isEqualTo(1);
+    assertThat(outbox.deadLetters().getFirst().kind()).isEqualTo(EngineDeletionOutbox.Kind.SWEEP);
+    assertThat(outbox.deadLetters().getFirst().lastOutcome()).isEqualTo("retries_exhausted");
+  }
+
+  @Test
+  void aSecondDeleteIsIdempotentWhenTheEngineHasNothingLeft() {
+    final TellomiEngineAccountDeletionNotifier n = sweepNotifier();
+    n.onAccountDeleted(UUID.randomUUID());
+    n.drain();
+    clock.advance(SECOND_DELETE);
+    script.add(r(Outcome.ALREADY_GONE, 410));
+    n.drain();
+    assertThat(outbox.pendingCount()).isZero();
+    assertThat(outbox.deadLetterCount()).isZero();
+  }
+
+  @Test
+  void aRecycledAciCancelsTheSecondDeleteButNotAPendingFirstDelete() {
+    final TellomiEngineAccountDeletionNotifier n = sweepNotifier();
+    final UUID aci = UUID.randomUUID();
+    n.onAccountDeleted(aci);
+    n.drain();
+    assertThat(outbox.pendingCount()).isEqualTo(1); // the sweep
+
+    n.onAccountCreatedWithRecycledAci(aci);         // same number registered again: same ACI, same pseudonym
+    assertThat(outbox.pendingCount()).isZero();
+    clock.advance(Duration.ofDays(1));
+    n.drain();
+    assertThat(sent).as("the new account's data is not erased by the old schedule").hasSize(1);
+
+    // a first delete that is still waiting is NOT cancelled (erasure wins, design doc Q3)
+    final UUID other = UUID.randomUUID();
+    n.onAccountDeleted(other);
+    n.onAccountCreatedWithRecycledAci(other);
+    assertThat(outbox.pendingCount()).isEqualTo(1);
+    n.drain();
+    assertThat(sent).hasSize(2);
+
+    // an unrelated ACI cancels nothing, and a failing outbox does not throw
+    n.onAccountCreatedWithRecycledAci(UUID.randomUUID());
+    final EngineDeletionOutbox hostile = new InMemoryEngineDeletionOutbox(1) {
+      @Override
+      public synchronized boolean cancelSweep(final byte[] sub) {
+        throw new RuntimeException("storage down");
+      }
+    };
+    notifier(sweepConfig, TOKENS::pseudonym, hostile).onAccountCreatedWithRecycledAci(UUID.randomUUID());
+  }
+
+  @Test
+  void aNewDeletionOfTheSamePseudonymSupersedesAPendingSecondDelete() {
+    final TellomiEngineAccountDeletionNotifier n = sweepNotifier();
+    final UUID aci = UUID.randomUUID();
+    n.onAccountDeleted(aci);
+    n.drain();                                      // sweep pending (due +70 min)
+    clock.advance(Duration.ofMinutes(10));
+    n.onAccountDeleted(aci);                        // re-registered with the same ACI, deleted again
+    assertThat(outbox.pendingCount()).isEqualTo(1);
+    assertThat(outbox.due(clock.instant(), 10)).hasSize(1).allMatch(e -> e.kind() == EngineDeletionOutbox.Kind.DELETE);
+    n.drain();
+    assertThat(sent).hasSize(2);
+    // and the new deletion gets its own second delete, 70 minutes after *its* time
+    clock.advance(SECOND_DELETE.minusSeconds(1));
+    assertThat(n.drain()).isZero();
+    clock.advance(Duration.ofSeconds(1));
+    assertThat(n.drain()).isEqualTo(1);
+    assertThat(sent).hasSize(3);
+  }
+
+  @Test
+  void failingToScheduleTheSecondDeleteNeverAffectsTheFirst() {
+    final EngineDeletionOutbox hostile = new InMemoryEngineDeletionOutbox(10) {
+      @Override
+      public synchronized boolean enqueueSweep(final byte[] sub, final Instant dueAt, final Instant enqueuedAt) {
+        throw new RuntimeException("storage down");
+      }
+    };
+    final TellomiEngineAccountDeletionNotifier n = notifier(sweepConfig, TOKENS::pseudonym, hostile);
+    n.onAccountDeleted(UUID.randomUUID());
+    n.drain(); // must not throw
+    assertThat(sent).hasSize(1);
+    assertThat(hostile.pendingCount()).isZero();
+    assertThat(hostile.deadLetterCount()).isZero();
+  }
+
+  @Test
+  void theSecondDeleteIsBoundedByTheOutboxAndOnePerPseudonym() {
+    final InMemoryEngineDeletionOutbox tiny = new InMemoryEngineDeletionOutbox(2);
+    final TellomiEngineAccountDeletionNotifier n = notifier(sweepConfig, TOKENS::pseudonym, tiny);
+    for (int i = 0; i < 2; i++) {
+      n.onAccountDeleted(UUID.randomUUID());
+    }
+    n.drain();
+    assertThat(tiny.pendingCount()).as("two sweeps, within the bound").isEqualTo(2);
+    n.onAccountDeleted(UUID.randomUUID());          // outbox full of sweeps: this one is dropped, not the sweeps
+    assertThat(tiny.pendingCount()).isEqualTo(2);
+    final byte[] sub = TOKENS.pseudonym(UUID.randomUUID());
+    assertThat(tiny.enqueueSweep(sub, clock.instant(), clock.instant())).isFalse();
+    assertThat(tiny.pendingCount()).isEqualTo(2);
+  }
+
+  @Test
+  void anEntryNeverPrintsThePseudonym() {
+    final UUID aci = UUID.randomUUID();
+    sweepNotifier().onAccountDeleted(aci);
+    final EngineDeletionOutbox.Entry entry = outbox.due(clock.instant(), 1).getFirst();
+    assertThat(entry.toString()).doesNotContain(Base64.getUrlEncoder().withoutPadding().encodeToString(entry.sub()))
+        .doesNotContain(Arrays.toString(entry.sub())).doesNotContain(aci.toString());
+  }
+
+  @Test
+  void theSecondDeleteLogsNoIdentifiersEither() {
+    final TellomiEngineAccountDeletionNotifier n = sweepNotifier();
+    final UUID aci = UUID.randomUUID();
+    final byte[] sub = TOKENS.pseudonym(aci);
+    n.onAccountDeleted(aci);
+    n.drain();
+    clock.advance(SECOND_DELETE);
+    script.add(r(Outcome.RETRY, 503));
+    n.drain();
+    clock.advance(Duration.ofMinutes(5));
+    n.drain();
+    n.onAccountCreatedWithRecycledAci(aci);
+
+    final String text = allLogText();
+    assertThat(text).contains("kind=sweep");
+    assertThat(text).doesNotContain(aci.toString())
+        .doesNotContain(Base64.getUrlEncoder().withoutPadding().encodeToString(sub))
+        .doesNotContain(Base64.getEncoder().encodeToString(sub)).doesNotContain(Arrays.toString(sub))
+        .doesNotContain("engine.example.invalid").doesNotContain("Bearer");
+  }
 }

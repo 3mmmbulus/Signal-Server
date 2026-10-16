@@ -2142,6 +2142,36 @@ class AccountsManagerTest {
   }
 
   @Test
+  void listenersAreToldWhenAnAccountIsCreatedWithARecycledAci() throws Exception {
+    final UUID recentlyDeletedUuid = UUID.randomUUID();
+    when(accounts.findRecentlyDeletedAccountIdentifier(any())).thenReturn(Optional.of(recentlyDeletedUuid));
+    when(accounts.create(any(), any())).thenReturn(true);
+    final AccountsManager.AccountDeletionListener broken = mock(AccountsManager.AccountDeletionListener.class);
+    doThrow(new IllegalStateException("listener bug")).when(broken).onAccountCreatedWithRecycledAci(any());
+    final AccountsManager.AccountDeletionListener listener = mock(AccountsManager.AccountDeletionListener.class);
+    accountsManager.addDeletionListener(broken);
+    accountsManager.addDeletionListener(listener);
+
+    final Account account = createAccount("+18005550123", new AccountAttributes(false, 1, 2, null, null, true, null, null));
+
+    assertEquals(recentlyDeletedUuid, account.getAccountIdentifier());
+    verify(listener).onAccountCreatedWithRecycledAci(recentlyDeletedUuid); // and a throwing one did not break creation
+    verify(listener, never()).onAccountDeleted(any());
+  }
+
+  @Test
+  void listenersAreNotToldAboutAnOrdinaryNewAccount() throws Exception {
+    when(accounts.findRecentlyDeletedAccountIdentifier(any())).thenReturn(Optional.empty());
+    when(accounts.create(any(), any())).thenReturn(true);
+    final AccountsManager.AccountDeletionListener listener = mock(AccountsManager.AccountDeletionListener.class);
+    accountsManager.addDeletionListener(listener);
+
+    createAccount("+18005550124", new AccountAttributes(false, 1, 2, null, null, true, null, null));
+
+    verifyNoInteractions(listener);
+  }
+
+  @Test
   void deletionListenerIsToldAboutAnAccountDisplacedByANumberChange() throws Exception {
     final String originalNumber = "+14152222222";
     final String targetNumber = "+14153333333";

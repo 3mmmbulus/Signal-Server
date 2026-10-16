@@ -22,7 +22,7 @@ class TellomiEngineDeletionConfigurationTest {
   private static TellomiEngineDeletionConfiguration with(final boolean enabled, final String baseUrl,
       final byte[] key) {
     return new TellomiEngineDeletionConfiguration(enabled, baseUrl, key == null ? null : new SecretBytes(key), null,
-        null, null, null, null, null, null, null);
+        null, null, null, null, null, null, null, null);
   }
 
   @Test
@@ -92,17 +92,32 @@ class TellomiEngineDeletionConfigurationTest {
     final byte[] key = TellomiEngineDeletionTestSupport.SERVICE_KEY;
     final SecretBytes k = new SecretBytes(key);
     final String url = "https://engine.example.invalid";
-    assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, null, 0, null, null, null, null, null))
+    assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, null, 0, null, null, null, null, null, null))
         .hasMessageContaining("maxAttempts");
-    assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, null, 51, null, null, null, null, null))
+    assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, null, 51, null, null, null, null, null, null))
         .hasMessageContaining("maxAttempts");
     assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, null, null,
-        Duration.ofMinutes(2), Duration.ofSeconds(1), null, null, null)).hasMessageContaining("maxBackoff");
+        Duration.ofMinutes(2), Duration.ofSeconds(1), null, null, null, null)).hasMessageContaining("maxBackoff");
     assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, Duration.ZERO, null, null, null,
-        null, null, null)).hasMessageContaining("requestTimeout");
+        null, null, null, null)).hasMessageContaining("requestTimeout");
     assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, Duration.ofMinutes(5), null, null,
-        null, null, null, null)).hasMessageContaining("60 seconds");
+        null, null, null, null, null)).hasMessageContaining("60 seconds");
     assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, null, null, null, null, null, 0,
-        null)).hasMessageContaining("maxPending");
+        null, null)).hasMessageContaining("maxPending");
+  }
+
+  @Test
+  void secondDeleteDelayDefaultsToSeventyMinutesAndCanBeTurnedOff() {
+    final TellomiEngineDeletionConfiguration c = with(true, "https://engine.example.invalid",
+        TellomiEngineDeletionTestSupport.SERVICE_KEY);
+    assertThat(c.secondDeleteDelay()).isEqualTo(Duration.ofMinutes(70));
+    final SecretBytes k = new SecretBytes(TellomiEngineDeletionTestSupport.SERVICE_KEY);
+    final String url = "https://engine.example.invalid";
+    assertThat(new TellomiEngineDeletionConfiguration(true, url, k, null, null, null, null, null, null, null,
+        Duration.ZERO, null).secondDeleteDelay()).isEqualTo(Duration.ZERO);
+    assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, null, null, null, null, null,
+        null, Duration.ofMinutes(-1), null)).hasMessageContaining("secondDeleteDelay");
+    assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, null, null, null, null, null,
+        null, Duration.ofHours(25), null)).hasMessageContaining("secondDeleteDelay");
   }
 }

@@ -246,6 +246,11 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
   @FunctionalInterface
   public interface AccountDeletionListener {
     void onAccountDeleted(UUID accountIdentifier);
+
+    /// A new account was created with the ACI of a recently deleted one (same number re-registered inside the
+    /// deleted-accounts window, so the ACI is recycled). Same rules as above. Default: ignore.
+    default void onAccountCreatedWithRecycledAci(final UUID accountIdentifier) {
+    }
   }
 
   private final List<AccountDeletionListener> deletionListeners = new CopyOnWriteArrayList<>();
@@ -637,6 +642,10 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
         previousPushTokenType,
         accountAttributes.recoveryPassword().isPresent(),
         userAgent);
+
+    if (accountCreationType == AccountCreationType.RECENTLY_DELETED) {
+      notifyRecycledAci(account.getAccountIdentifier());
+    }
 
     return account;
   }
@@ -1657,6 +1666,16 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
 
     disconnectionRequestManager.requestDisconnection(account);
     notifyDeletionListeners(account.getAccountIdentifier());
+  }
+
+  private void notifyRecycledAci(final UUID accountIdentifier) {
+    for (final AccountDeletionListener listener : deletionListeners) {
+      try {
+        listener.onAccountCreatedWithRecycledAci(accountIdentifier);
+      } catch (final Throwable t) {
+        logger.warn("Account deletion listener failed ({})", t.getClass().getSimpleName());
+      }
+    }
   }
 
   private void notifyDeletionListeners(final UUID accountIdentifier) {

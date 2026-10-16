@@ -28,10 +28,16 @@ final class TellomiEngineDeletionTestSupport {
     return enabled(baseUrl, Duration.ofSeconds(2), 4, true);
   }
 
+  /// second delete off (PT0S), so these tests see exactly one request per account
   static TellomiEngineDeletionConfiguration enabled(final String baseUrl, final Duration requestTimeout,
       final int maxAttempts, final boolean notFoundMeansDeleted) {
+    return enabled(baseUrl, requestTimeout, maxAttempts, notFoundMeansDeleted, Duration.ZERO);
+  }
+
+  static TellomiEngineDeletionConfiguration enabled(final String baseUrl, final Duration requestTimeout,
+      final int maxAttempts, final boolean notFoundMeansDeleted, final Duration secondDeleteDelay) {
     return new TellomiEngineDeletionConfiguration(true, baseUrl, new SecretBytes(SERVICE_KEY), Duration.ofSeconds(2),
         requestTimeout, maxAttempts, Duration.ofSeconds(10), Duration.ofSeconds(80), Duration.ofSeconds(1), 100,
-        notFoundMeansDeleted);
+        secondDeleteDelay, notFoundMeansDeleted);
   }
 }

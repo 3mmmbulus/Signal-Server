@@ -11,6 +11,7 @@ import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.Metrics;
 import java.time.Clock;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -31,6 +32,9 @@ import org.whispersystems.textsecuregcm.tellomi.EngineDeletionOutbox.Entry;
 /// `sub = TellomiFeedTokens.pseudonym(aci)`, the same derivation the credentials use.
 ///
 /// Rules (see ACCOUNT-DELETION-ENGINE-DESIGN.md):
+/// - after the first delete succeeded, a **second delete** is queued for `accountDeletedAt + secondDeleteDelay`
+///   (default 70 minutes): a feed credential issued just before the deletion stays valid for up to an hour and the
+///   engine cannot know the Signal account is gone. A new account that recycles the same ACI cancels it;
 /// - **never in the way of the account deletion.** {@link #onAccountDeleted} runs after the account is already gone,
 ///   only puts the pseudonym into the outbox and never throws or blocks on the network;
 /// - the actual calls run on the notifier's own executor thread ({@link #start}) or from {@link #drain};
@@ -54,6 +58,10 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
   private static final String RESULT_COUNTER = name(TellomiEngineAccountDeletionNotifier.class, "result");
   private static final String NOT_FOUND_ASSUMED_COUNTER =
       name(TellomiEngineAccountDeletionNotifier.class, "notFoundAssumedDeleted");
+  private static final String SWEEP_SCHEDULED_COUNTER = name(TellomiEngineAccountDeletionNotifier.class, "sweepScheduled");
+  private static final String SWEEP_NOT_SCHEDULED_COUNTER =
+      name(TellomiEngineAccountDeletionNotifier.class, "sweepNotScheduled");
+  private static final String SWEEP_CANCELLED_COUNTER = name(TellomiEngineAccountDeletionNotifier.class, "sweepCancelled");
   private static final String PENDING_GAUGE = name(TellomiEngineAccountDeletionNotifier.class, "pending");
   private static final String DEAD_LETTER_GAUGE = name(TellomiEngineAccountDeletionNotifier.class, "deadLetter");
 
@@ -69,6 +77,7 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
   private final Duration initialBackoff;
   private final Duration maxBackoff;
   private final Duration pollInterval;
+  private final Duration secondDeleteDelay;
   private final ScheduledExecutorService executor;
 
   private final AtomicBoolean notFoundWarned = new AtomicBoolean();
@@ -94,6 +103,7 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
     this.initialBackoff = config.initialBackoff();
     this.maxBackoff = config.maxBackoff();
     this.pollInterval = config.pollInterval();
+    this.secondDeleteDelay = config.secondDeleteDelay();
     this.executor = executor;
 
     Gauge.builder(PENDING_GAUGE, outbox, EngineDeletionOutbox::pendingCount).register(Metrics.globalRegistry);
@@ -119,13 +129,27 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
           executor.execute(this::drainQuietly);
         }
       } else {
-        Metrics.counter(RESULT_COUNTER, "result", "dropped").increment();
+        Metrics.counter(RESULT_COUNTER, "kind", "delete", "result", "dropped").increment();
         log.error("Tellomi engine deletion: outbox full, a deletion notice was dropped; reconciliation must cover it");
       }
     } catch (final Throwable t) {
       // must not break account deletion, whatever happens here
-      Metrics.counter(RESULT_COUNTER, "result", "dropped").increment();
+      Metrics.counter(RESULT_COUNTER, "kind", "delete", "result", "dropped").increment();
       log.error("Tellomi engine deletion: could not queue a deletion notice ({})", t.getClass().getSimpleName());
+    }
+  }
+
+  /// The ACI (hence the pseudonym) was recycled by a new account: a pending second delete would erase that account's
+  /// data, so it is cancelled. A pending first delete is not (see the design doc, re-registration). Never throws.
+  @Override
+  public void onAccountCreatedWithRecycledAci(final UUID accountIdentifier) {
+    try {
+      if (outbox.cancelSweep(pseudonym.apply(accountIdentifier))) {
+        Metrics.counter(SWEEP_CANCELLED_COUNTER).increment();
+        log.info("Tellomi engine deletion: a pending second delete was cancelled (the account identifier was recycled)");
+      }
+    } catch (final Throwable t) {
+      log.error("Tellomi engine deletion: could not cancel a second delete ({})", t.getClass().getSimpleName());
     }
   }
 
@@ -152,7 +176,8 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
         // a sender must not throw; if it does, it counts as a failed attempt rather than a hot loop
         result = new Result(Outcome.RETRY, 0, Optional.empty());
       }
-      Metrics.counter(ATTEMPT_COUNTER, "outcome", result.outcome().name().toLowerCase(java.util.Locale.ROOT)).increment();
+      Metrics.counter(ATTEMPT_COUNTER, "kind", kindTag(entry), "outcome",
+          result.outcome().name().toLowerCase(java.util.Locale.ROOT)).increment();
       final int attempts = entry.attempts() + 1;
 
       switch (result.outcome()) {
@@ -192,18 +217,48 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
     return attempted;
   }
 
+  private static String kindTag(final Entry entry) {
+    return entry.kind() == EngineDeletionOutbox.Kind.SWEEP ? "sweep" : "delete";
+  }
+
   private void finish(final Entry entry, final int attempts, final Result result, final String how) {
     outbox.complete(entry.entryId());
-    Metrics.counter(RESULT_COUNTER, "result", "delivered").increment();
-    log.info("Tellomi engine deletion: entry={} result={} status={} attempts={} age_s={}", entry.entryId(), how,
-        result.status(), attempts, Duration.between(entry.enqueuedAt(), clock.instant()).toSeconds());
+    Metrics.counter(RESULT_COUNTER, "kind", kindTag(entry), "result", "delivered").increment();
+    log.info("Tellomi engine deletion: entry={} kind={} result={} status={} attempts={} age_s={}", entry.entryId(),
+        kindTag(entry), how, result.status(), attempts,
+        Duration.between(entry.enqueuedAt(), clock.instant()).toSeconds());
+    if (entry.kind() == EngineDeletionOutbox.Kind.DELETE) {
+      scheduleSecondDelete(entry);
+    }
+  }
+
+  /// Queues the second delete for `accountDeletedAt + secondDeleteDelay` (immediately if that is already past). One
+  /// entry per pseudonym and it never schedules another, so this is bounded; failing to schedule it (outbox full,
+  /// something throws) costs only the second delete, never the first.
+  private void scheduleSecondDelete(final Entry deleted) {
+    if (secondDeleteDelay.isZero()) {
+      return;
+    }
+    try {
+      final Instant now = clock.instant();
+      final Instant due = deleted.enqueuedAt().plus(secondDeleteDelay);
+      if (outbox.enqueueSweep(deleted.sub(), due.isBefore(now) ? now : due, deleted.enqueuedAt())) {
+        Metrics.counter(SWEEP_SCHEDULED_COUNTER).increment();
+      } else {
+        Metrics.counter(SWEEP_NOT_SCHEDULED_COUNTER).increment();
+        log.warn("Tellomi engine deletion: the second delete could not be scheduled (outbox full or entry exists)");
+      }
+    } catch (final RuntimeException e) {
+      Metrics.counter(SWEEP_NOT_SCHEDULED_COUNTER).increment();
+      log.warn("Tellomi engine deletion: the second delete could not be scheduled ({})", e.getClass().getSimpleName());
+    }
   }
 
   private void deadLetter(final Entry entry, final int attempts, final Result result, final String reason) {
     outbox.deadLetter(entry.entryId(), attempts, reason);
-    Metrics.counter(RESULT_COUNTER, "result", "dead_letter").increment();
-    log.warn("Tellomi engine deletion: entry={} result=dead_letter reason={} status={} attempts={} age_s={}",
-        entry.entryId(), reason, result.status(), attempts,
+    Metrics.counter(RESULT_COUNTER, "kind", kindTag(entry), "result", "dead_letter").increment();
+    log.warn("Tellomi engine deletion: entry={} kind={} result=dead_letter reason={} status={} attempts={} age_s={}",
+        entry.entryId(), kindTag(entry), reason, result.status(), attempts,
         Duration.between(entry.enqueuedAt(), clock.instant()).toSeconds());
   }
 

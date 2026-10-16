@@ -19,6 +19,9 @@ tlsKeyStore:
 # OFF by default. Placeholders only: nothing below is a real address or key. Needs `tellomiFeed` (the pseudonym key).
 # See docs/drafts/ACCOUNT-DELETION-ENGINE-DESIGN.md in the tellomi repo before enabling: the in-memory outbox loses
 # pending notices on restart.
+# PRODUCTION ROLLOUT GATE: do NOT set enabled: true in production until legal has answered the question "Legal question
+# (owner: legal, pending)" in that design doc (what account deletion may erase: engine data AND report records, evidence,
+# interaction logs). Also needs the engine build that answers 503 service_disabled when its key is unset.
 # tellomiEngineDeletion:
 #   enabled: false
 #   baseUrl: https://engine.example.invalid          # https only (http allowed for a loopback address)
@@ -30,6 +33,7 @@ tlsKeyStore:
 #   maxBackoff: PT15M
 #   pollInterval: PT5S
 #   maxPending: 10000
+#   secondDeleteDelay: PT70M                          # repeat delete after the feed credentials (<= 1h) have expired; PT0S = off
 #   notFoundMeansDeleted: true
 
 stripe:

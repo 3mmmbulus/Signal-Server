@@ -18,14 +18,36 @@ import java.util.UUID;
 /// turned on in production; see ACCOUNT-DELETION-ENGINE-DESIGN.md §3.
 public interface EngineDeletionOutbox {
 
-  /// A unit of work. Immutable; the outbox returns a fresh instance after every change.
-  record Entry(UUID entryId, byte[] sub, int attempts, Instant nextAttemptAt, Instant enqueuedAt,
-               String lastOutcome) {
+  /// `DELETE`: the deletion that follows the account deletion. `SWEEP`: the second delete scheduled after it, to catch
+  /// what a feed credential that was still valid (up to 1 h) could create after the first delete.
+  enum Kind {
+    DELETE, SWEEP
   }
 
-  /// Adds the pseudonym unless it is already pending (or already dead-lettered). Returns `false` if the entry was
-  /// not added because the outbox is full; `true` otherwise (added, or already there).
+  /// A unit of work. Immutable; the outbox returns a fresh instance after every change. `enqueuedAt` is when the
+  /// account was deleted (a sweep keeps the time of the delete it follows).
+  record Entry(UUID entryId, Kind kind, byte[] sub, int attempts, Instant nextAttemptAt, Instant enqueuedAt,
+               String lastOutcome) {
+    /// no `sub` in text form, ever (it ends up in logs and assertion messages)
+    @Override
+    public String toString() {
+      return "Entry[entryId=" + entryId + ", kind=" + kind + ", attempts=" + attempts + ", nextAttemptAt="
+          + nextAttemptAt + ", lastOutcome=" + lastOutcome + "]";
+    }
+  }
+
+  /// Adds a `DELETE` for the pseudonym unless one is already pending (or dead-lettered). A pending `SWEEP` for the
+  /// same pseudonym is replaced by the new `DELETE` (a newer deletion supersedes the old schedule). Returns `false`
+  /// if the entry was not added because the outbox is full; `true` otherwise (added, or already there).
   boolean enqueue(byte[] sub, Instant now);
+
+  /// Adds a `SWEEP` due at `dueAt`, unless the pseudonym already has any entry (pending or dead-lettered). At most
+  /// one entry per pseudonym, so a sweep never multiplies. Returns `true` when it was added.
+  boolean enqueueSweep(byte[] sub, Instant dueAt, Instant enqueuedAt);
+
+  /// Removes a pending `SWEEP` for the pseudonym (the ACI was recycled by a new account, whose data the sweep would
+  /// wrongly erase). Does nothing to a pending `DELETE`. Returns `true` if one was removed.
+  boolean cancelSweep(byte[] sub);
 
   /// Entries whose `nextAttemptAt` is not after `now`, oldest first, at most `limit`.
   List<Entry> due(Instant now, int limit);

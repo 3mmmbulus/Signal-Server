@@ -17,6 +17,12 @@ import org.whispersystems.textsecuregcm.configuration.secrets.SecretBytes;
 /// 默认关（`enabled = false`）：不配置这一段、或 `enabled: false`，行为和上游完全一样，不发任何请求。
 /// 关着的时候不校验其它字段，所以示例配置里可以放占位符。
 ///
+/// **上线闸门（不要在生产打开 `enabled`，直到下面全部满足）：**
+/// 1. 法务回答了「删号时能不能把举报记录、证据截图、互动日志一起删」（设计文档 §LEGAL，owner: legal，待答）。引擎
+///    现在的 `delete_account` 一律全删，包括别人对该用户内容的举报；需要保留的话要先改引擎，开关不能替法务做决定；
+/// 2. 待办队列换成持久实现（现在只在内存，重启就丢）；
+/// 3. 引擎侧 `/internal` 在没配服务密钥时回 503 `service_disabled`（content-engine `bot/engine-internal-503-service-disabled`）。
+///
 /// @param enabled              总开关，默认 `false`
 /// @param baseUrl              引擎的根地址，必须 `https`（本机回环地址可用 `http`，只给联调）。不带路径
 /// @param serviceKey           引擎 `ENGINE_SERVICE_KEY` 的值（Signal 的秘密包，base64），至少 32 字节；
@@ -28,6 +34,9 @@ import org.whispersystems.textsecuregcm.configuration.secrets.SecretBytes;
 /// @param maxBackoff           等待的上限，默认 15 分钟
 /// @param pollInterval         后台扫一遍待办的间隔，默认 5 秒
 /// @param maxPending           内存待办队列的上限，默认 10000；满了丢掉新的（记 ERROR 和计数），**不影响账号删除**
+/// @param secondDeleteDelay    第二次删除：账号删除后过这么久再删一次，默认 70 分钟（反馈凭证最长 1 小时有效，引擎不知道
+///                             Signal 账号已经没了，旧凭证在这段时间里还能重新建主页等）。`PT0S` = 不做第二次删除。
+///                             只在第一次删除成功之后才排；不超过 24 小时
 /// @param notFoundMeansDeleted 引擎回 404 / 410 算已删除，默认 `true`。注意：真实引擎在没配服务密钥时
 ///                             整个 `/internal` 路由是 404（`not_found`），这时 404 并不是「已删」，见设计文档第 5 节
 public record TellomiEngineDeletionConfiguration(boolean enabled,
@@ -40,6 +49,7 @@ public record TellomiEngineDeletionConfiguration(boolean enabled,
                                                  @Nullable Duration maxBackoff,
                                                  @Nullable Duration pollInterval,
                                                  @Nullable Integer maxPending,
+                                                 @Nullable Duration secondDeleteDelay,
                                                  @Nullable Boolean notFoundMeansDeleted) {
 
   public static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofSeconds(5);
@@ -49,6 +59,9 @@ public record TellomiEngineDeletionConfiguration(boolean enabled,
   public static final Duration DEFAULT_MAX_BACKOFF = Duration.ofMinutes(15);
   public static final Duration DEFAULT_POLL_INTERVAL = Duration.ofSeconds(5);
   public static final int DEFAULT_MAX_PENDING = 10_000;
+  /// feed credential lifetime (1 h, `TellomiFeedController.CREDENTIAL_LIFETIME`) + the engine's 60 s leeway + margin
+  public static final Duration DEFAULT_SECOND_DELETE_DELAY = Duration.ofMinutes(70);
+  public static final Duration MAX_SECOND_DELETE_DELAY = Duration.ofHours(24);
 
   public static final int MIN_SERVICE_KEY_BYTES = 32;
 
@@ -60,22 +73,24 @@ public record TellomiEngineDeletionConfiguration(boolean enabled,
     maxBackoff = maxBackoff == null ? DEFAULT_MAX_BACKOFF : maxBackoff;
     pollInterval = pollInterval == null ? DEFAULT_POLL_INTERVAL : pollInterval;
     maxPending = maxPending == null ? DEFAULT_MAX_PENDING : maxPending;
+    secondDeleteDelay = secondDeleteDelay == null ? DEFAULT_SECOND_DELETE_DELAY : secondDeleteDelay;
     notFoundMeansDeleted = notFoundMeansDeleted == null ? Boolean.TRUE : notFoundMeansDeleted;
 
     if (enabled) {
       validateEnabled(baseUrl, serviceKey, connectTimeout, requestTimeout, maxAttempts, initialBackoff, maxBackoff,
-          pollInterval, maxPending);
+          pollInterval, maxPending, secondDeleteDelay);
     }
   }
 
   /// 关着（缺省）的配置：什么都不做
   public static TellomiEngineDeletionConfiguration disabled() {
-    return new TellomiEngineDeletionConfiguration(false, null, null, null, null, null, null, null, null, null, null);
+    return new TellomiEngineDeletionConfiguration(false, null, null, null, null, null, null, null, null, null, null, null);
   }
 
   private static void validateEnabled(@Nullable final String baseUrl, @Nullable final SecretBytes serviceKey,
       final Duration connectTimeout, final Duration requestTimeout, final int maxAttempts,
-      final Duration initialBackoff, final Duration maxBackoff, final Duration pollInterval, final int maxPending) {
+      final Duration initialBackoff, final Duration maxBackoff, final Duration pollInterval, final int maxPending,
+      final Duration secondDeleteDelay) {
 
     if (baseUrl == null || baseUrl.isBlank()) {
       throw new IllegalArgumentException("tellomiEngineDeletion.baseUrl is required when enabled");
@@ -118,6 +133,9 @@ public record TellomiEngineDeletionConfiguration(boolean enabled,
     }
     if (maxAttempts < 1 || maxAttempts > 50) {
       throw new IllegalArgumentException("tellomiEngineDeletion.maxAttempts must be between 1 and 50");
+    }
+    if (secondDeleteDelay.isNegative() || secondDeleteDelay.compareTo(MAX_SECOND_DELETE_DELAY) > 0) {
+      throw new IllegalArgumentException("tellomiEngineDeletion.secondDeleteDelay must be between PT0S (off) and PT24H");
     }
     if (maxPending < 1) {
       throw new IllegalArgumentException("tellomiEngineDeletion.maxPending must be positive");

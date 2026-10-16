@@ -52,6 +52,7 @@ import java.util.Queue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -237,6 +238,20 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     DeletionReason(final String tagValue) {
       this.tagValue = tagValue;
     }
+  }
+
+  /// Tellomi: told after an account has really been deleted (the user's own deletion, the admin command, expiry, and a
+  /// number change that displaces another account). Implementations must be quick and must not throw: they run on the
+  /// deleting thread, inside the account lock, and a failure here is logged and ignored (the account stays deleted).
+  @FunctionalInterface
+  public interface AccountDeletionListener {
+    void onAccountDeleted(UUID accountIdentifier);
+  }
+
+  private final List<AccountDeletionListener> deletionListeners = new CopyOnWriteArrayList<>();
+
+  public void addDeletionListener(final AccountDeletionListener listener) {
+    deletionListeners.add(listener);
   }
 
   private enum AccountCreationType {
@@ -1641,6 +1656,18 @@ public class AccountsManager extends RedisPubSubAdapter<String, String> implemen
     redisDelete(account);
 
     disconnectionRequestManager.requestDisconnection(account);
+    notifyDeletionListeners(account.getAccountIdentifier());
+  }
+
+  private void notifyDeletionListeners(final UUID accountIdentifier) {
+    for (final AccountDeletionListener listener : deletionListeners) {
+      try {
+        listener.onAccountDeleted(accountIdentifier);
+      } catch (final Throwable t) {
+        // the account is already deleted; never turn a listener's failure into a failed deletion. Log the class only.
+        logger.warn("Account deletion listener failed ({})", t.getClass().getSimpleName());
+      }
+    }
   }
 
   private String getAccountMapKey(String key) {

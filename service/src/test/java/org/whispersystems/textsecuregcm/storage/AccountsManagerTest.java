@@ -2068,6 +2068,110 @@ class AccountsManagerTest {
             null));
   }
 
+  // Tellomi (ADR-0071 §5.4, L2-5): listeners are told after an account is really gone
+
+  private Account deletableAccount() {
+    final Account account = AccountsHelper.generateTestAccount("+14152222222", UUID.randomUUID(), UUID.randomUUID(),
+        List.of(DevicesHelper.createDevice(Device.PRIMARY_ID)), new byte[UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH]);
+    addRetrievableAccount(account);
+    return account;
+  }
+
+  @Test
+  void deletionListenerIsToldAfterTheAccountIsDeleted() {
+    final Account account = deletableAccount();
+    final AccountsManager.AccountDeletionListener listener = mock(AccountsManager.AccountDeletionListener.class);
+    accountsManager.addDeletionListener(listener);
+
+    accountsManager.delete(account.getAccountIdentifier(), AccountsManager.DeletionReason.USER_REQUEST);
+
+    final org.mockito.InOrder inOrder = org.mockito.Mockito.inOrder(accounts, listener);
+    inOrder.verify(accounts).delete(eq(account.getAccountIdentifier()), any());
+    inOrder.verify(listener).onAccountDeleted(account.getAccountIdentifier());
+  }
+
+  @ParameterizedTest
+  @org.junit.jupiter.params.provider.EnumSource(AccountsManager.DeletionReason.class)
+  void deletionListenerIsToldForEveryDeletionReason(final AccountsManager.DeletionReason reason) {
+    final Account account = deletableAccount();
+    final AccountsManager.AccountDeletionListener listener = mock(AccountsManager.AccountDeletionListener.class);
+    accountsManager.addDeletionListener(listener);
+
+    accountsManager.delete(account.getAccountIdentifier(), reason);
+
+    verify(listener).onAccountDeleted(account.getAccountIdentifier());
+  }
+
+  @Test
+  void deletionListenerIsNotToldAboutAnAccountThatWasAlreadyGone() {
+    final AccountsManager.AccountDeletionListener listener = mock(AccountsManager.AccountDeletionListener.class);
+    accountsManager.addDeletionListener(listener);
+    when(accounts.getByAccountIdentifier(any())).thenReturn(Optional.empty());
+
+    accountsManager.delete(UUID.randomUUID(), AccountsManager.DeletionReason.USER_REQUEST); // a spurious retry
+
+    verifyNoInteractions(listener);
+  }
+
+  @Test
+  void deletionListenerIsNotToldWhenTheDeletionFailsAndTheFailureStillPropagates() {
+    final Account account = deletableAccount();
+    final AccountsManager.AccountDeletionListener listener = mock(AccountsManager.AccountDeletionListener.class);
+    accountsManager.addDeletionListener(listener);
+    doThrow(new RuntimeException("dynamo down")).when(accounts).delete(any(), any());
+
+    assertThrows(RuntimeException.class,
+        () -> accountsManager.delete(account.getAccountIdentifier(), AccountsManager.DeletionReason.USER_REQUEST));
+
+    verifyNoInteractions(listener);
+  }
+
+  @Test
+  void aFailingDeletionListenerNeverBreaksTheDeletionOrTheOtherListeners() {
+    final Account account = deletableAccount();
+    final AccountsManager.AccountDeletionListener broken = mock(AccountsManager.AccountDeletionListener.class);
+    doThrow(new IllegalStateException("engine notifier bug")).when(broken).onAccountDeleted(any());
+    final AccountsManager.AccountDeletionListener fine = mock(AccountsManager.AccountDeletionListener.class);
+    accountsManager.addDeletionListener(broken);
+    accountsManager.addDeletionListener(fine);
+
+    accountsManager.delete(account.getAccountIdentifier(), AccountsManager.DeletionReason.USER_REQUEST); // no exception
+
+    verify(accounts).delete(eq(account.getAccountIdentifier()), any());
+    verify(fine).onAccountDeleted(account.getAccountIdentifier());
+  }
+
+  @Test
+  void deletionListenerIsToldAboutAnAccountDisplacedByANumberChange() throws Exception {
+    final String originalNumber = "+14152222222";
+    final String targetNumber = "+14153333333";
+    final UUID existingAccountUuid = UUID.randomUUID();
+    final UUID uuid = UUID.randomUUID();
+    final UUID originalPni = UUID.randomUUID();
+    final UUID targetPni = UUID.randomUUID();
+    final ECKeyPair pniIdentityKeyPair = ECKeyPair.generate();
+
+    final Account existingAccount = AccountsHelper.generateTestAccount(targetNumber, existingAccountUuid, targetPni,
+        List.of(DevicesHelper.createDevice(Device.PRIMARY_ID)), new byte[UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH]);
+    when(accounts.getByE164(targetNumber)).thenReturn(Optional.of(existingAccount));
+
+    final Account account = AccountsHelper.generateTestAccount(originalNumber, uuid, originalPni,
+        List.of(DevicesHelper.createDevice(Device.PRIMARY_ID)), new byte[UnidentifiedAccessUtil.UNIDENTIFIED_ACCESS_KEY_LENGTH]);
+    addRetrievableAccount(account);
+
+    final AccountsManager.AccountDeletionListener listener = mock(AccountsManager.AccountDeletionListener.class);
+    accountsManager.addDeletionListener(listener);
+
+    accountsManager.changeNumber(uuid, targetNumber, new IdentityKey(pniIdentityKeyPair.getPublicKey()),
+        Map.of(Device.PRIMARY_ID, KeysHelper.signedECPreKey(1, pniIdentityKeyPair)),
+        Map.of(Device.PRIMARY_ID, KeysHelper.signedKEMPreKey(2, pniIdentityKeyPair)),
+        Map.of(Device.PRIMARY_ID, 1));
+
+    // the displaced account is deleted, not the one changing its number
+    verify(listener).onAccountDeleted(existingAccountUuid);
+    verify(listener, never()).onAccountDeleted(uuid);
+  }
+
   private void addRetrievableAccount(final Account account) {
     when(accounts.getByAccountIdentifier(account.getAccountIdentifier()))
         .thenReturn(Optional.of(account));

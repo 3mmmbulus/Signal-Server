@@ -15,6 +15,23 @@ logging:
 tlsKeyStore:
   password: secret://tlsKeyStore.password
 
+# Tellomi (ADR-0071 section 5.4, L2-5): tell the content engine when an account is deleted.
+# OFF by default. Placeholders only: nothing below is a real address or key. Needs `tellomiFeed` (the pseudonym key).
+# See docs/drafts/ACCOUNT-DELETION-ENGINE-DESIGN.md in the tellomi repo before enabling: the in-memory outbox loses
+# pending notices on restart.
+# tellomiEngineDeletion:
+#   enabled: false
+#   baseUrl: https://engine.example.invalid          # https only (http allowed for a loopback address)
+#   serviceKey: secret://tellomiEngineDeletion.serviceKey   # same value as the engine's ENGINE_SERVICE_KEY (base64, >= 32 bytes)
+#   connectTimeout: PT5S
+#   requestTimeout: PT10S
+#   maxAttempts: 8
+#   initialBackoff: PT5S
+#   maxBackoff: PT15M
+#   pollInterval: PT5S
+#   maxPending: 10000
+#   notFoundMeansDeleted: true
+
 stripe:
   apiKey: secret://stripe.apiKey
   idempotencyKeyGenerator: secret://stripe.idempotencyKeyGenerator

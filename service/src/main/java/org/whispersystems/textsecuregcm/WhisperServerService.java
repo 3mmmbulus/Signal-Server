@@ -66,6 +66,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.function.Function;
@@ -99,6 +100,9 @@ import org.whispersystems.textsecuregcm.auth.IdlePrimaryDeviceAuthenticatedWebSo
 import org.whispersystems.textsecuregcm.auth.PhoneVerificationTokenManager;
 import org.whispersystems.textsecuregcm.auth.RegistrationLockVerificationManager;
 import org.whispersystems.textsecuregcm.auth.TellomiFeedTokens;
+import org.whispersystems.textsecuregcm.tellomi.EngineDeletionClient;
+import org.whispersystems.textsecuregcm.tellomi.InMemoryEngineDeletionOutbox;
+import org.whispersystems.textsecuregcm.tellomi.TellomiEngineAccountDeletionNotifier;
 import org.whispersystems.textsecuregcm.auth.webauthn.WebAuthnCeremonyManager;
 import org.whispersystems.textsecuregcm.auth.grpc.ProhibitAuthenticationInterceptor;
 import org.whispersystems.textsecuregcm.auth.grpc.RequireAuthenticationInterceptor;
@@ -116,6 +120,7 @@ import org.whispersystems.textsecuregcm.captcha.RegistrationCaptchaManager;
 import org.whispersystems.textsecuregcm.captcha.ShortCodeExpander;
 import org.whispersystems.textsecuregcm.captcha.TurnstileCaptchaClient;
 import org.whispersystems.textsecuregcm.configuration.AltchaCaptchaConfiguration;
+import org.whispersystems.textsecuregcm.configuration.TellomiEngineDeletionConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiFeedConfiguration;
 import org.whispersystems.textsecuregcm.configuration.RegistrationRiskConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TurnstileCaptchaConfiguration;
@@ -1423,6 +1428,27 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
           tellomiFeedConfig.cnHostSuffixes(), asnInfoProviderSupplier, clock);
       environment.jersey().register(tellomiFeedController);
       webSocketEnvironment.jersey().register(tellomiFeedController);
+    }
+
+    // Tellomi（ADR-0071 §5.4、L2-5）：账号删除后通知内容引擎删数据。默认关；开着时要求配了 tellomiFeed（假名密钥）。
+    // 只是排队，真正的请求在自己的线程里发，引擎挂了也不影响账号删除。内存待办队列不持久，上线前要换成持久实现（设计文档第 3 节）
+    final TellomiEngineDeletionConfiguration tellomiEngineDeletionConfig = config.getTellomiEngineDeletionConfiguration();
+    if (tellomiEngineDeletionConfig != null && tellomiEngineDeletionConfig.enabled()) {
+      if (tellomiFeedConfig == null) {
+        throw new IllegalStateException("tellomiEngineDeletion.enabled requires tellomiFeed (the pseudonym key)");
+      }
+      final TellomiFeedTokens engineDeletionTokens = new TellomiFeedTokens(tellomiFeedConfig.signingKey().value(),
+          tellomiFeedConfig.pseudonymKey().value());
+      final ScheduledExecutorService engineDeletionExecutor =
+          ScheduledExecutorServiceBuilder.of(environment, "tellomiEngineDeletion").threads(1).build();
+      final EngineDeletionClient engineDeletionClient = new EngineDeletionClient(tellomiEngineDeletionConfig);
+      final TellomiEngineAccountDeletionNotifier engineDeletionNotifier = new TellomiEngineAccountDeletionNotifier(
+          tellomiEngineDeletionConfig, engineDeletionTokens::pseudonym,
+          new InMemoryEngineDeletionOutbox(tellomiEngineDeletionConfig.maxPending()),
+          engineDeletionClient::delete, clock, ThreadLocalRandom.current()::nextDouble, engineDeletionExecutor);
+      accountsManager.addDeletionListener(engineDeletionNotifier);
+      engineDeletionNotifier.start();
+      log.warn("Tellomi engine deletion is enabled with the in-memory outbox: pending notices are lost on restart");
     }
 
     WebSocketEnvironment<AuthenticatedDevice> provisioningEnvironment = new WebSocketEnvironment<>(environment,

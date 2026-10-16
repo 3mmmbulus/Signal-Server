@@ -69,6 +69,7 @@ import org.whispersystems.textsecuregcm.configuration.SubscriptionConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TlsKeyStoreConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TotpConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TurnConfiguration;
+import org.whispersystems.textsecuregcm.configuration.TellomiEngineDeletionConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiFeedConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TurnstileCaptchaConfiguration;
 import org.whispersystems.textsecuregcm.configuration.UsernamePolicyConfiguration;
@@ -332,6 +333,11 @@ public class WhisperServerConfiguration extends Configuration {
   @Valid
   @JsonProperty
   private TellomiFeedConfiguration tellomiFeed;
+
+  // Tellomi（ADR-0071 §5.4、L2-5）：optional; absent or `enabled: false` = account deletion does not notify the content engine
+  @Valid
+  @JsonProperty
+  private TellomiEngineDeletionConfiguration tellomiEngineDeletion;
 
   // Tellomi: optional; absent = no username denylist (upstream behaviour)
   @Valid
@@ -633,6 +639,10 @@ public class WhisperServerConfiguration extends Configuration {
 
   public AltchaCaptchaConfiguration getAltchaCaptchaConfiguration() {
     return altchaCaptcha;
+  }
+
+  public TellomiEngineDeletionConfiguration getTellomiEngineDeletionConfiguration() {
+    return tellomiEngineDeletion;
   }
 
   public TellomiFeedConfiguration getTellomiFeedConfiguration() {

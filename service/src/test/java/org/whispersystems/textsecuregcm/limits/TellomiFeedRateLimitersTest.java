@@ -82,4 +82,26 @@ class TellomiFeedRateLimitersTest {
     assertThat(friend.config()).isEqualTo(override);
     assertThat(audience.config()).isEqualTo(RateLimiters.For.TELLOMI_FEED_AUDIENCE_LIST.defaultConfig());
   }
+
+  @Test
+  void degradedPerIpDescriptorsAreWiderThanThePerAccountOnesAndKeepTheirFailMode() {
+    final RateLimiters rateLimiters = rateLimiters();
+
+    assertThat(rateLimiters.getTellomiFeedFriendAssertionIpLimiter().config())
+        .isEqualTo(new RateLimiterConfig(1200, Duration.ofSeconds(3), false));
+    assertThat(rateLimiters.getTellomiFeedAudienceListIpLimiter().config())
+        .isEqualTo(new RateLimiterConfig(120, Duration.ofSeconds(10), true));
+    assertThat(RateLimiters.For.TELLOMI_FEED_FRIEND_ASSERTION_IP.id()).isEqualTo("tellomiFeedFriendAssertionIp");
+    assertThat(RateLimiters.For.TELLOMI_FEED_AUDIENCE_LIST_IP.id()).isEqualTo("tellomiFeedAudienceListIp");
+
+    // Per-IP buckets must hold at least one account's worth (shared NAT) and keep the fail mode of the per-account one.
+    final RateLimiterConfig friendIp = RateLimiters.For.TELLOMI_FEED_FRIEND_ASSERTION_IP.defaultConfig();
+    final RateLimiterConfig friend = RateLimiters.For.TELLOMI_FEED_FRIEND_ASSERTION.defaultConfig();
+    assertThat(friendIp.bucketSize()).isGreaterThan(friend.bucketSize());
+    assertThat(friendIp.failOpen()).isEqualTo(friend.failOpen());
+    final RateLimiterConfig audienceIp = RateLimiters.For.TELLOMI_FEED_AUDIENCE_LIST_IP.defaultConfig();
+    final RateLimiterConfig audience = RateLimiters.For.TELLOMI_FEED_AUDIENCE_LIST.defaultConfig();
+    assertThat(audienceIp.bucketSize()).isGreaterThan(audience.bucketSize());
+    assertThat(audienceIp.failOpen()).isEqualTo(audience.failOpen());
+  }
 }

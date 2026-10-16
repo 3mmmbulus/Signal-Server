@@ -384,6 +384,50 @@ class TellomiFeedControllerTest {
     verify(audienceLimiter, never()).validate(any(UUID.class));
   }
 
+  // ---- server-feed-audit S-3: the limiter's backing store (Redis) is down ----
+  // A limiter with failOpen = false rethrows whatever the store threw (LeakyBucketRateLimiter#validate), a plain
+  // runtime exception. That used to surface as an anonymous 500; it is a dependency outage, so say 503 with a
+  // Retry-After the clients can read, still fail closed (no signature) and still without an existence lookup.
+
+  @Test
+  void addFriendLimiterStoreDownIsServiceUnavailableAndFailsClosed() throws Exception {
+    doThrow(new RuntimeException("redis down")).when(friendLimiter).validate(any(UUID.class));
+    final UUID existing = UUID.randomUUID();
+    when(accountsManager.getByAccountIdentifier(existing)).thenReturn(Optional.of(mock(Account.class)));
+
+    try (final Response response = request("/v1/tellomi/feed/friend-assertions")
+        .post(Entity.json(Map.of("peer_aci", existing.toString())))) {
+      assertThat(response.getStatus()).isEqualTo(503);
+      assertThat(response.getHeaderString("Retry-After")).isEqualTo("30");
+      assertThat(response.hasEntity() ? response.readEntity(String.class) : "").doesNotContain("assertion");
+    }
+    verifyNoInteractions(accountsManager);
+  }
+
+  @Test
+  void audienceListLimiterStoreDownIsServiceUnavailableWithoutASignature() throws Exception {
+    doThrow(new RuntimeException("redis down")).when(audienceLimiter).validate(any(UUID.class));
+
+    try (final Response response = request("/v1/tellomi/feed/audience-lists")
+        .post(Entity.json(Map.of("kind", "include", "peer_acis", List.of(UUID.randomUUID().toString()))))) {
+      assertThat(response.getStatus()).isEqualTo(503);
+      assertThat(response.getHeaderString("Retry-After")).isEqualTo("30");
+      assertThat(response.hasEntity() ? response.readEntity(String.class) : "").doesNotContain("audience_token");
+    }
+  }
+
+  @Test
+  void rateLimitedStaysTooManyRequestsWhenTheStoreErrorHandlingIsInPlace() throws Exception {
+    // Control: a real "limit hit" must not be turned into 503 by the store-down handling.
+    doThrow(new RateLimitExceededException(Duration.ofSeconds(9))).when(friendLimiter).validate(any(UUID.class));
+
+    try (final Response response = request("/v1/tellomi/feed/friend-assertions")
+        .post(Entity.json(Map.of("peer_aci", UUID.randomUUID().toString())))) {
+      assertThat(response.getStatus()).isEqualTo(429);
+      assertThat(response.getHeaderString("Retry-After")).isEqualTo("9");
+    }
+  }
+
   @Test
   void credentialIsNotRateLimitedByTheFeedLimiters() throws Exception {
     // /auth is a cheap HMAC with no existence oracle; it is intentionally not covered by B-9 (see notes).

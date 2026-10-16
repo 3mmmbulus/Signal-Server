@@ -92,7 +92,7 @@ class TellomiFeedControllerTest {
       .addProvider(new AuthValueFactoryProvider.Binder<>(AuthenticatedDevice.class))
       .setMapper(SystemMapper.jsonMapper())
       .setTestContainerFactory(new GrizzlyWebTestContainerFactory())
-      .addResource(new TellomiFeedController(accountsManager, TOKENS, List.of("tellomi.cn"), () -> asnInfoProvider,
+      .addResource(new TellomiFeedController(accountsManager, rateLimiters, TOKENS, List.of("tellomi.cn"), () -> asnInfoProvider,
           Clock.fixed(NOW_WITH_NANOS, ZoneOffset.UTC)))
       .build();
 

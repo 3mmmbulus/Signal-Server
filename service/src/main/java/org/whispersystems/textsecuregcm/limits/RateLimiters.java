@@ -65,7 +65,19 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     CREATE_DONATION_PERMIT("createDonationCredential", new RateLimiterConfig(30, Duration.ofHours(4), true)),
     ONE_TIME_DONATION("oneTimeDonation", new RateLimiterConfig(5, Duration.ofMinutes(1), true)),
     ADD_SUBSCRIPTION_PAYMENT_METHOD("addSubscriptionPaymentMethod", new RateLimiterConfig(10, Duration.ofMinutes(1), true)),
-    CHECK_MFA("checkMfa", new RateLimiterConfig(50, Duration.ofHours(12), false))
+    CHECK_MFA("checkMfa", new RateLimiterConfig(50, Duration.ofHours(12), false)),
+    // Tellomi（ADR-0071 §5.3，B-9）：POST /v1/tellomi/feed/friend-assertions。按调用者账号计；它能探测某个 ACI 有没有账号
+    // （404 / 200），所以 Redis 不可用时拒绝（failOpen = false）。首次同步最多约 500 个好友，所以桶是 600，之后每 6 秒回一个
+    // （一小时约 600 次）。运行时可以用动态配置 limits.tellomiFeedFriendAssertion 调。
+    TELLOMI_FEED_FRIEND_ASSERTION("tellomiFeedFriendAssertion", new RateLimiterConfig(600, Duration.ofSeconds(6), false)),
+    // Tellomi：POST /v1/tellomi/feed/audience-lists。按调用者账号计；不查账号是否存在，没有探测问题，只防刷（每次最多
+    // 500 人要算 HMAC），Redis 不可用时放行。一个人短时间最多发 60 条「部分可见」帖子，之后每 20 秒回一个。
+    TELLOMI_FEED_AUDIENCE_LIST("tellomiFeedAudienceList", new RateLimiterConfig(60, Duration.ofSeconds(20), true)),
+    // Tellomi：ASN 表是空的（没载入 / 载入失败）时的第二层——按来源 IP 计。表空时认不出大陆 IP，区域一律按 global，
+    // 光靠按账号的限流不够（一个 IP 后面可以有很多账号），所以这时两个接口再按 IP 限一层。表载入后不用这两个。
+    // 比按账号的宽一倍（运营商级 NAT 后面会有很多正常用户）；失败策略和按账号的一致。动态配置同样能调。
+    TELLOMI_FEED_FRIEND_ASSERTION_IP("tellomiFeedFriendAssertionIp", new RateLimiterConfig(1200, Duration.ofSeconds(3), false)),
+    TELLOMI_FEED_AUDIENCE_LIST_IP("tellomiFeedAudienceListIp", new RateLimiterConfig(120, Duration.ofSeconds(10), true))
     ;
 
     private final String id;
@@ -254,5 +266,21 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
 
   public RateLimiter getCheckMfaLimiter() {
     return forDescriptor(For.CHECK_MFA);
+  }
+
+  public RateLimiter getTellomiFeedFriendAssertionLimiter() {
+    return forDescriptor(For.TELLOMI_FEED_FRIEND_ASSERTION);
+  }
+
+  public RateLimiter getTellomiFeedAudienceListLimiter() {
+    return forDescriptor(For.TELLOMI_FEED_AUDIENCE_LIST);
+  }
+
+  public RateLimiter getTellomiFeedFriendAssertionIpLimiter() {
+    return forDescriptor(For.TELLOMI_FEED_FRIEND_ASSERTION_IP);
+  }
+
+  public RateLimiter getTellomiFeedAudienceListIpLimiter() {
+    return forDescriptor(For.TELLOMI_FEED_AUDIENCE_LIST_IP);
   }
 }

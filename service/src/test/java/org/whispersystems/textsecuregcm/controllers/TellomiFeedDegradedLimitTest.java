@@ -31,6 +31,9 @@ import jakarta.ws.rs.client.Entity;
 import jakarta.ws.rs.client.Invocation;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.Response;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
@@ -40,6 +43,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.zip.GZIPOutputStream;
 import org.glassfish.jersey.test.grizzly.GrizzlyWebTestContainerFactory;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -48,6 +52,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InOrder;
 import org.slf4j.LoggerFactory;
 import org.whispersystems.textsecuregcm.asn.AsnInfoProvider;
+import org.whispersystems.textsecuregcm.asn.AsnInfoProviderImpl;
 import org.whispersystems.textsecuregcm.auth.AuthenticatedDevice;
 import org.whispersystems.textsecuregcm.auth.TellomiFeedTokens;
 import org.whispersystems.textsecuregcm.filters.RemoteAddressFilter;
@@ -267,6 +272,31 @@ class TellomiFeedDegradedLimitTest {
 
     verify(friendIpLimiter).validate("unknown");
     verify(friendLimiter).validate(AuthHelper.VALID_UUID);
+  }
+
+  // ---- a table that loaded but has no rows (what Hong Kong's asnTable points at today) ----
+
+  @Test
+  void aLoadedButEmptyTableIsDegradedToo() throws Exception {
+    final AsnInfoProvider loadedEmpty = AsnInfoProviderImpl.fromTsvGz(new ByteArrayInputStream(emptyGzip()));
+    assertThat(loadedEmpty).isNotSameAs(AsnInfoProvider.EMPTY);
+    assertThat(loadedEmpty.isEmpty()).isTrue();
+    provider.set(loadedEmpty);
+
+    assertThat(postFriend()).isEqualTo(200);
+
+    final InOrder order = inOrder(friendIpLimiter, friendLimiter);
+    order.verify(friendIpLimiter).validate(IP);
+    order.verify(friendLimiter).validate(AuthHelper.VALID_UUID);
+    assertThat(count("degradedIpLimit", "endpoint", "friendAssertion")).isEqualTo(1);
+  }
+
+  private static byte[] emptyGzip() throws IOException {
+    final ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    try (final GZIPOutputStream gzip = new GZIPOutputStream(bytes)) {
+      gzip.write(new byte[0]);
+    }
+    return bytes.toByteArray();
   }
 
   // ---- loaded table: unchanged ----

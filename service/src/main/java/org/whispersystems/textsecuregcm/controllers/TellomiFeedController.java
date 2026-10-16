@@ -258,7 +258,8 @@ public class TellomiFeedController {
   }
 
   /// ASN 表判定的大陆 IP。表是 S3 上的 iptoasn TSV，由 `asnTable` 配置的监视器载入；还没载入（或载入失败）时提供者是
-  /// `AsnInfoProvider.EMPTY`，这一项就永远判不出 CN（PR #13 的欠账）。区域的判定不改（仍按 global，改成 cn 是产品决定），
+  /// `AsnInfoProvider.EMPTY`，载入的是个空表时（香港目前指向一个空的 gzip）提供者里一条都没有——两种都是
+  /// `AsnInfoProvider.isEmpty()`，这一项就永远判不出 CN（PR #13 的欠账）。区域的判定不改（仍按 global，改成 cn 是产品决定），
   /// 但它是可见的（计数器 `asnTableEmpty` + 一条 WARN），并且这时好友声明和受众名单接口会多限一层按 IP 的
   /// （见 `validateIpWhileAsnTableIsEmpty`）。
   private boolean isCnAddress(@Nullable final String remoteAddress) {
@@ -266,7 +267,7 @@ public class TellomiFeedController {
       return false;
     }
     final AsnInfoProvider provider = asnInfoProviderSupplier.get();
-    if (provider == AsnInfoProvider.EMPTY) {
+    if (provider.isEmpty()) {
       noteAsnTableEmpty();
       return false;
     }
@@ -280,7 +281,7 @@ public class TellomiFeedController {
   private void noteAsnTableEmpty() {
     Metrics.counter(ASN_TABLE_EMPTY_COUNTER_NAME).increment();
     if (asnTableEmptyLogged.compareAndSet(false, true)) {
-      log.warn("Tellomi feed: the ASN table is empty (not loaded yet, or its S3 object failed to load); "
+      log.warn("Tellomi feed: the ASN table is empty (not loaded yet, its S3 object failed to load, or the object has no rows); "
           + "mainland IP detection is inactive (only +86 numbers and mainland entry hosts select region cn) "
           + "and friend-assertion / audience-list requests are rate limited per account AND per source address");
     }
@@ -292,7 +293,7 @@ public class TellomiFeedController {
   private void validateIpWhileAsnTableIsEmpty(final String endpoint, final Supplier<RateLimiter> ipLimiter,
       final ContainerRequestContext requestContext) throws RateLimitExceededException {
 
-    if (asnInfoProviderSupplier.get() != AsnInfoProvider.EMPTY) {
+    if (!asnInfoProviderSupplier.get().isEmpty()) {
       return;
     }
     noteAsnTableEmpty();

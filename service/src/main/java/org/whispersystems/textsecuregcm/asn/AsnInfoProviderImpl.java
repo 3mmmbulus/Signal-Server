@@ -119,6 +119,12 @@ public class AsnInfoProviderImpl implements AsnInfoProvider {
     this.asnBlocksByFirstIpv6 = requireNonNull(asnBlocksByFirstIpv6);
   }
 
+  /// Tellomi（B-9）：载入的是个空表（香港目前就是）也算空
+  @Override
+  public boolean isEmpty() {
+    return asnBlocksByFirstIpv4.isEmpty() && asnBlocksByFirstIpv6.isEmpty();
+  }
+
   @Nonnull
   @Override
   public Optional<AsnInfo> lookup(@Nonnull final String ipString) {

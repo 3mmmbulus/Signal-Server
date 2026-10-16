@@ -89,6 +89,10 @@ public class TellomiFeedController {
   @VisibleForTesting
   static final long LIMITER_UNAVAILABLE_RETRY_AFTER_SECONDS = 30;
 
+  /// Body code of the 404 for "no account has that ACI" (friend-assertions). A 404 without it means "no such route".
+  @VisibleForTesting
+  static final String ERROR_ACCOUNT_NOT_FOUND = "account_not_found";
+
   static final String REGION_CN = "cn";
   static final String REGION_GLOBAL = "global";
 
@@ -138,6 +142,10 @@ public class TellomiFeedController {
   public record FriendAssertion(String assertion) {
   }
 
+  /// `{"error": "<code>"}`, the same shape the content engine uses for its errors.
+  public record FeedError(String error) {
+  }
+
   public record AudienceListRequest(@NotNull @Pattern(regexp = "include|exclude") String kind,
                                     @NotEmpty @Size(max = MAX_AUDIENCE_MEMBERS)
                                     @JsonProperty("peer_acis") List<@NotBlank String> peerAcis) {
@@ -182,7 +190,7 @@ public class TellomiFeedController {
           """)
   @ApiResponse(responseCode = "200", description = "The signed assertion", useReturnTypeSchema = true)
   @ApiResponse(responseCode = "400", description = "`peer_aci` is not an ACI, or is the caller")
-  @ApiResponse(responseCode = "404", description = "No account has that ACI")
+  @ApiResponse(responseCode = "404", description = "No account has that ACI. The body is `{\"error\":\"account_not_found\"}`; a 404 without it means the route is not available on this server")
   @ApiResponse(responseCode = "429", description = "Too many friend assertions from this account (or, while the ASN table is empty, from this address)")
   @ApiResponse(responseCode = "503", description = "The rate limiter's store is unavailable; nothing was signed. Retry-After says when to retry")
   public FriendAssertion addFriend(@Auth final AuthenticatedDevice auth,
@@ -196,7 +204,12 @@ public class TellomiFeedController {
 
     final UUID peer = peer(auth, request.peerAci());
     if (accountsManager.getByAccountIdentifier(peer).isEmpty()) {
-      throw new NotFoundException();
+      // 带标记的 404：没有标记的 404 只可能是「这台服务器没有这条路由」（没配 tellomiFeed:），客户端据此区分，
+      // 见 FRIEND-ASSERTION-404-MARKER.md。其它状态码不变。
+      throw new NotFoundException(Response.status(Response.Status.NOT_FOUND)
+          .type(MediaType.APPLICATION_JSON_TYPE)
+          .entity(new FeedError(ERROR_ACCOUNT_NOT_FOUND))
+          .build());
     }
     return new FriendAssertion(tokens.friendAssertion(auth.accountIdentifier(), peer, "add",
         clock.instant().plus(FRIEND_ASSERTION_LIFETIME)));

@@ -36,6 +36,7 @@ import jakarta.ws.rs.core.Response;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -134,7 +135,10 @@ public class TellomiFeedController {
         .orElseThrow(() -> new WebApplicationException(Response.Status.UNAUTHORIZED));
 
     final String region = region(account, requestContext);
-    final Instant expiration = clock.instant().plus(CREDENTIAL_LIFETIME);
+    // Whole seconds, like the token's `exp`: Instant.toString() would otherwise print the clock's nanoseconds
+    // ("...12:00:00.654809212Z"), which the contract's example ("...12:00:00Z") and strict ISO-8601 parsers
+    // on the clients do not expect.
+    final Instant expiration = clock.instant().plus(CREDENTIAL_LIFETIME).truncatedTo(ChronoUnit.SECONDS);
     return new FeedCredential(tokens.credential(auth.accountIdentifier(), region, expiration),
         expiration.toString(), region);
   }

@@ -120,4 +120,44 @@ class TellomiEngineDeletionConfigurationTest {
     assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, null, null, null, null, null,
         null, Duration.ofHours(25), null)).hasMessageContaining("secondDeleteDelay");
   }
+
+  @Test
+  void theOutboxIsInMemoryUnlessATableIsConfigured() throws Exception {
+    final byte[] k = TellomiEngineDeletionTestSupport.SERVICE_KEY;
+    final TellomiEngineDeletionConfiguration inMemory = with(true, "https://engine.example.invalid", k);
+    assertThat(inMemory.durableOutbox()).isFalse();
+    assertThat(inMemory.outboxTableName()).isNull();
+    assertThat(inMemory.outboxTtl()).isEqualTo(Duration.ofDays(30));
+
+    final ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
+    final TellomiEngineDeletionConfiguration parsed = mapper.readValue(
+        "{\"enabled\":false,\"outboxTableName\":\" TellomiEngineDeletionOutbox \",\"outboxTtl\":\"P14D\"}",
+        TellomiEngineDeletionConfiguration.class);
+    assertThat(parsed.durableOutbox()).isTrue();
+    assertThat(parsed.outboxTableName()).as("trimmed").isEqualTo("TellomiEngineDeletionOutbox");
+    assertThat(parsed.outboxTtl()).isEqualTo(Duration.ofDays(14));
+
+    final TellomiEngineDeletionConfiguration blank = mapper.readValue("{\"outboxTableName\":\"  \"}",
+        TellomiEngineDeletionConfiguration.class);
+    assertThat(blank.durableOutbox()).as("a blank name is no name").isFalse();
+  }
+
+  @Test
+  void theOutboxTtlIsBoundedWhenATableIsConfigured() {
+    final SecretBytes k = new SecretBytes(TellomiEngineDeletionTestSupport.SERVICE_KEY);
+    final String url = "https://engine.example.invalid";
+    assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, null, null, null, null, null,
+        null, null, null, "T", Duration.ofHours(23))).isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("outboxTtl");
+    assertThatThrownBy(() -> new TellomiEngineDeletionConfiguration(true, url, k, null, null, null, null, null, null,
+        null, null, null, "T", Duration.ofDays(401))).isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("outboxTtl");
+    assertThat(new TellomiEngineDeletionConfiguration(true, url, k, null, null, null, null, null, null, null, null,
+        null, "T", Duration.ofDays(1)).outboxTtl()).isEqualTo(Duration.ofDays(1));
+    // not validated without a table, or while the feature is off
+    assertThat(new TellomiEngineDeletionConfiguration(true, url, k, null, null, null, null, null, null, null, null,
+        null, null, Duration.ofSeconds(1)).durableOutbox()).isFalse();
+    assertThat(new TellomiEngineDeletionConfiguration(false, null, null, null, null, null, null, null, null, null,
+        null, null, "T", Duration.ofSeconds(1)).enabled()).isFalse();
+  }
 }

@@ -21,7 +21,8 @@ tlsKeyStore:
 # pending notices on restart.
 # PRODUCTION ROLLOUT GATE: do NOT set enabled: true in production until legal has answered the question "Legal question
 # (owner: legal, pending)" in that design doc (what account deletion may erase: engine data AND report records, evidence,
-# interaction logs). Also needs the engine build that answers 503 service_disabled when its key is unset.
+# interaction logs). Also needs the engine build that answers 503 service_disabled when its key is unset, and (for a
+# production run) outboxTableName below, i.e. the durable outbox (the in-memory one loses pending notices on restart).
 # tellomiEngineDeletion:
 #   enabled: false
 #   baseUrl: https://engine.example.invalid          # https only (http allowed for a loopback address)
@@ -35,6 +36,8 @@ tlsKeyStore:
 #   maxPending: 10000
 #   secondDeleteDelay: PT70M                          # repeat delete after the feed credentials (<= 1h) have expired; PT0S = off
 #   notFoundMeansDeleted: true
+#   outboxTableName: TellomiEngineDeletionOutbox      # DynamoDB table (hash key S, index P-N, TTL attribute X); unset = in-memory outbox
+#   outboxTtl: P30D                                   # longest an outbox entry (incl. dead letters) lives; P1D..P400D
 
 stripe:
   apiKey: secret://stripe.apiKey

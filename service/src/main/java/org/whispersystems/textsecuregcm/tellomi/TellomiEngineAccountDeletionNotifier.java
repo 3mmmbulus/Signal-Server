@@ -51,6 +51,12 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
     Result delete(byte[] sub);
   }
 
+  /// Is there a live account with this ACI? May throw (store down): the notifier then does not send, and retries later.
+  @FunctionalInterface
+  public interface AccountLookup {
+    boolean isLive(UUID accountIdentifier);
+  }
+
   private static final Logger log = LoggerFactory.getLogger(TellomiEngineAccountDeletionNotifier.class);
 
   private static final String ENQUEUED_COUNTER = name(TellomiEngineAccountDeletionNotifier.class, "enqueued");
@@ -68,9 +74,17 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
   /// entries tried in one round
   static final int BATCH_SIZE = 50;
 
+  /// A first delete younger than this, on its first attempt, is sent without the live-account check: the account was
+  /// deleted seconds ago and erasure wins (design §6.3 point 1). Anything older, retried, or a second delete is "late".
+  static final Duration PROMPT_WINDOW = Duration.ofMinutes(2);
+
+  private static final String LIVE_SKIPPED_COUNTER = name(TellomiEngineAccountDeletionNotifier.class, "skippedLiveAccount");
+  private static final String LOOKUP_FAILED_COUNTER = name(TellomiEngineAccountDeletionNotifier.class, "lookupFailed");
+
   private final Function<UUID, byte[]> pseudonym;
   private final EngineDeletionOutbox outbox;
   private final Sender sender;
+  private final AccountLookup accounts;
   private final Clock clock;
   private final DoubleSupplier jitter;
   private final int maxAttempts;
@@ -84,12 +98,15 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
   private final AtomicBoolean authFailedLogged = new AtomicBoolean();
 
   /// @param pseudonym derives the engine `sub` from an ACI (`TellomiFeedTokens::pseudonym`)
+  /// @param accounts  the live-account check run before every *late* send (see {@link #PROMPT_WINDOW}); in production
+  ///                  `aci -> accountsManager.getByAccountIdentifier(aci).isPresent()`
   /// @param jitter    values in `[0, 1)`; `ThreadLocalRandom.current()::nextDouble` in production
   /// @param executor  runs {@link #drain}; `null` in tests that call {@link #drain} themselves
   public TellomiEngineAccountDeletionNotifier(final TellomiEngineDeletionConfiguration config,
       final Function<UUID, byte[]> pseudonym,
       final EngineDeletionOutbox outbox,
       final Sender sender,
+      final AccountLookup accounts,
       final Clock clock,
       final DoubleSupplier jitter,
       final ScheduledExecutorService executor) {
@@ -97,6 +114,7 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
     this.pseudonym = pseudonym;
     this.outbox = outbox;
     this.sender = sender;
+    this.accounts = java.util.Objects.requireNonNull(accounts, "accounts");
     this.clock = clock;
     this.jitter = jitter;
     this.maxAttempts = config.maxAttempts();
@@ -122,7 +140,7 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
   @Override
   public void onAccountDeleted(final UUID accountIdentifier) {
     try {
-      final boolean accepted = outbox.enqueue(pseudonym.apply(accountIdentifier), clock.instant());
+      final boolean accepted = outbox.enqueue(accountIdentifier, pseudonym.apply(accountIdentifier), clock.instant());
       if (accepted) {
         Metrics.counter(ENQUEUED_COUNTER).increment();
         if (executor != null) {
@@ -169,6 +187,30 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
     int attempted = 0;
     for (final Entry entry : due) {
       attempted++;
+      if (isLate(entry)) {
+        final Boolean live = liveAccount(entry);
+        if (live == null) {
+          // cannot tell whether the ACI was re-registered: do not send, try again later (counts as an attempt)
+          final int attempts = entry.attempts() + 1;
+          if (attempts >= maxAttempts) {
+            deadLetter(entry, attempts, new Result(Outcome.RETRY, 0, Optional.empty()), "lookup_failed");
+          } else {
+            outbox.reschedule(entry, attempts, clock.instant().plus(backoff(attempts, Optional.empty())),
+                "retry_lookup");
+          }
+          return attempted;
+        }
+        if (live) {
+          // the ACI belongs to a live account again: the engine cannot tell the two apart, so this late delete would
+          // erase the new account's data. Drop it (a first, prompt delete is never dropped: erasure wins).
+          outbox.complete(entry);
+          Metrics.counter(LIVE_SKIPPED_COUNTER, "kind", kindTag(entry)).increment();
+          log.info("Tellomi engine deletion: entry={} kind={} dropped, the account identifier is live again "
+              + "(re-registered); attempts={} age_s={}", entry.entryId(), kindTag(entry), entry.attempts(),
+              Duration.between(entry.enqueuedAt(), clock.instant()).toSeconds());
+          continue;
+        }
+      }
       Result result;
       try {
         result = sender.delete(entry.sub());
@@ -198,7 +240,7 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
             deadLetter(entry, attempts, result, "retries_exhausted");
           } else {
             final Duration delay = backoff(attempts, result.retryAfter());
-            outbox.reschedule(entry.entryId(), attempts, clock.instant().plus(delay), "retry_" + result.status());
+            outbox.reschedule(entry, attempts, clock.instant().plus(delay), "retry_" + result.status());
             log.info("Tellomi engine deletion: entry={} attempt={} status={} retry_in_s={}", entry.entryId(),
                 attempts, result.status(), delay.toSeconds());
           }
@@ -217,12 +259,32 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
     return attempted;
   }
 
+  /// A send that is not "the first delete, promptly": a second delete, a retry, or anything that waited longer than
+  /// {@link #PROMPT_WINDOW} (outage, restart, dead-letter requeue).
+  private boolean isLate(final Entry entry) {
+    return entry.kind() == EngineDeletionOutbox.Kind.SWEEP
+        || entry.attempts() > 0
+        || Duration.between(entry.enqueuedAt(), clock.instant()).compareTo(PROMPT_WINDOW) > 0;
+  }
+
+  /// `true` = live account with this ACI, `false` = none, `null` = could not check
+  private Boolean liveAccount(final Entry entry) {
+    try {
+      return accounts.isLive(entry.aci());
+    } catch (final RuntimeException e) {
+      Metrics.counter(LOOKUP_FAILED_COUNTER).increment();
+      log.warn("Tellomi engine deletion: could not check whether the account identifier is live ({}); not sending",
+          e.getClass().getSimpleName());
+      return null;
+    }
+  }
+
   private static String kindTag(final Entry entry) {
     return entry.kind() == EngineDeletionOutbox.Kind.SWEEP ? "sweep" : "delete";
   }
 
   private void finish(final Entry entry, final int attempts, final Result result, final String how) {
-    outbox.complete(entry.entryId());
+    outbox.complete(entry);
     Metrics.counter(RESULT_COUNTER, "kind", kindTag(entry), "result", "delivered").increment();
     log.info("Tellomi engine deletion: entry={} kind={} result={} status={} attempts={} age_s={}", entry.entryId(),
         kindTag(entry), how, result.status(), attempts,
@@ -242,7 +304,7 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
     try {
       final Instant now = clock.instant();
       final Instant due = deleted.enqueuedAt().plus(secondDeleteDelay);
-      if (outbox.enqueueSweep(deleted.sub(), due.isBefore(now) ? now : due, deleted.enqueuedAt())) {
+      if (outbox.enqueueSweep(deleted.aci(), deleted.sub(), due.isBefore(now) ? now : due, deleted.enqueuedAt())) {
         Metrics.counter(SWEEP_SCHEDULED_COUNTER).increment();
       } else {
         Metrics.counter(SWEEP_NOT_SCHEDULED_COUNTER).increment();
@@ -255,7 +317,7 @@ public class TellomiEngineAccountDeletionNotifier implements AccountsManager.Acc
   }
 
   private void deadLetter(final Entry entry, final int attempts, final Result result, final String reason) {
-    outbox.deadLetter(entry.entryId(), attempts, reason);
+    outbox.deadLetter(entry, attempts, reason);
     Metrics.counter(RESULT_COUNTER, "kind", kindTag(entry), "result", "dead_letter").increment();
     log.warn("Tellomi engine deletion: entry={} kind={} result=dead_letter reason={} status={} attempts={} age_s={}",
         entry.entryId(), kindTag(entry), reason, result.status(), attempts,

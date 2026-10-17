@@ -101,6 +101,8 @@ import org.whispersystems.textsecuregcm.auth.PhoneVerificationTokenManager;
 import org.whispersystems.textsecuregcm.auth.RegistrationLockVerificationManager;
 import org.whispersystems.textsecuregcm.auth.TellomiFeedTokens;
 import org.whispersystems.textsecuregcm.tellomi.EngineDeletionClient;
+import org.whispersystems.textsecuregcm.tellomi.DynamoDbEngineDeletionOutbox;
+import org.whispersystems.textsecuregcm.tellomi.EngineDeletionOutbox;
 import org.whispersystems.textsecuregcm.tellomi.InMemoryEngineDeletionOutbox;
 import org.whispersystems.textsecuregcm.tellomi.TellomiEngineAccountDeletionNotifier;
 import org.whispersystems.textsecuregcm.auth.webauthn.WebAuthnCeremonyManager;
@@ -1480,13 +1482,28 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
       final ScheduledExecutorService engineDeletionExecutor =
           ScheduledExecutorServiceBuilder.of(environment, "tellomiEngineDeletion").threads(1).build();
       final EngineDeletionClient engineDeletionClient = new EngineDeletionClient(tellomiEngineDeletionConfig);
+      final EngineDeletionOutbox engineDeletionOutbox;
+      if (tellomiEngineDeletionConfig.durableOutbox()) {
+        // the table must exist (and have TTL on `X`): fail at startup, not at the first account deletion
+        final DynamoDbEngineDeletionOutbox durable = new DynamoDbEngineDeletionOutbox(dynamoDbClient,
+            tellomiEngineDeletionConfig.outboxTableName(), clock, tellomiEngineDeletionConfig.outboxTtl());
+        durable.verifyTable();
+        engineDeletionOutbox = durable;
+      } else {
+        engineDeletionOutbox = new InMemoryEngineDeletionOutbox(tellomiEngineDeletionConfig.maxPending());
+      }
       final TellomiEngineAccountDeletionNotifier engineDeletionNotifier = new TellomiEngineAccountDeletionNotifier(
-          tellomiEngineDeletionConfig, engineDeletionTokens::pseudonym,
-          new InMemoryEngineDeletionOutbox(tellomiEngineDeletionConfig.maxPending()),
-          engineDeletionClient::delete, clock, () -> ThreadLocalRandom.current().nextDouble(), engineDeletionExecutor);
+          tellomiEngineDeletionConfig, engineDeletionTokens::pseudonym, engineDeletionOutbox,
+          engineDeletionClient::delete, aci -> accountsManager.getByAccountIdentifier(aci).isPresent(), clock,
+          () -> ThreadLocalRandom.current().nextDouble(), engineDeletionExecutor);
       accountsManager.addDeletionListener(engineDeletionNotifier);
       engineDeletionNotifier.start();
-      log.warn("Tellomi engine deletion is enabled with the in-memory outbox: pending notices are lost on restart");
+      if (tellomiEngineDeletionConfig.durableOutbox()) {
+        log.warn("Tellomi engine deletion is enabled with the durable outbox; it still must not be enabled in "
+            + "production before legal has answered (design doc 8A) and a reconciliation job exists");
+      } else {
+        log.warn("Tellomi engine deletion is enabled with the in-memory outbox: pending notices are lost on restart");
+      }
     }
 
     WebSocketEnvironment<AuthenticatedDevice> provisioningEnvironment = new WebSocketEnvironment<>(environment,

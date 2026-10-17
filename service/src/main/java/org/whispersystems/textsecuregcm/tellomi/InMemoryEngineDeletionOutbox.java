@@ -34,12 +34,12 @@ public class InMemoryEngineDeletionOutbox implements EngineDeletionOutbox {
   }
 
   @Override
-  public synchronized boolean enqueue(final byte[] sub, final Instant now) {
+  public synchronized boolean enqueue(final UUID aci, final byte[] sub, final Instant now) {
     final String k = key(sub);
     final Entry existing = pending.get(k);
     if (existing != null && existing.kind() == Kind.SWEEP) {
       // a new account deletion for the same pseudonym (the ACI was recycled and deleted again): delete now
-      pending.put(k, new Entry(UUID.randomUUID(), Kind.DELETE, existing.sub(), 0, now, now, "none"));
+      pending.put(k, new Entry(UUID.randomUUID(), Kind.DELETE, existing.sub(), aci, 0, now, now, "none"));
       return true;
     }
     if (existing != null || dead.containsKey(k)) {
@@ -48,17 +48,17 @@ public class InMemoryEngineDeletionOutbox implements EngineDeletionOutbox {
     if (pending.size() >= maxPending) {
       return false;
     }
-    pending.put(k, new Entry(UUID.randomUUID(), Kind.DELETE, sub.clone(), 0, now, now, "none"));
+    pending.put(k, new Entry(UUID.randomUUID(), Kind.DELETE, sub.clone(), aci, 0, now, now, "none"));
     return true;
   }
 
   @Override
-  public synchronized boolean enqueueSweep(final byte[] sub, final Instant dueAt, final Instant enqueuedAt) {
+  public synchronized boolean enqueueSweep(final UUID aci, final byte[] sub, final Instant dueAt, final Instant enqueuedAt) {
     final String k = key(sub);
     if (pending.containsKey(k) || dead.containsKey(k) || pending.size() >= maxPending) {
       return false;
     }
-    pending.put(k, new Entry(UUID.randomUUID(), Kind.SWEEP, sub.clone(), 0, dueAt, enqueuedAt, "none"));
+    pending.put(k, new Entry(UUID.randomUUID(), Kind.SWEEP, sub.clone(), aci, 0, dueAt, enqueuedAt, "none"));
     return true;
   }
 
@@ -83,32 +83,32 @@ public class InMemoryEngineDeletionOutbox implements EngineDeletionOutbox {
   }
 
   @Override
-  public synchronized void complete(final UUID entryId) {
-    pending.values().removeIf(e -> e.entryId().equals(entryId));
+  public synchronized void complete(final Entry entry) {
+    pending.values().removeIf(e -> e.entryId().equals(entry.entryId()));
   }
 
   @Override
-  public synchronized void reschedule(final UUID entryId, final int attempts, final Instant nextAttemptAt,
+  public synchronized void reschedule(final Entry entry, final int attempts, final Instant nextAttemptAt,
       final String lastOutcome) {
     for (final Map.Entry<String, Entry> me : pending.entrySet()) {
       final Entry e = me.getValue();
-      if (e.entryId().equals(entryId)) {
-        me.setValue(new Entry(e.entryId(), e.kind(), e.sub(), attempts, nextAttemptAt, e.enqueuedAt(), lastOutcome));
+      if (e.entryId().equals(entry.entryId())) {
+        me.setValue(new Entry(e.entryId(), e.kind(), e.sub(), e.aci(), attempts, nextAttemptAt, e.enqueuedAt(), lastOutcome));
         return;
       }
     }
   }
 
   @Override
-  public synchronized void deadLetter(final UUID entryId, final int attempts, final String lastOutcome) {
+  public synchronized void deadLetter(final Entry entry, final int attempts, final String lastOutcome) {
     for (final Map.Entry<String, Entry> me : new ArrayList<>(pending.entrySet())) {
       final Entry e = me.getValue();
-      if (e.entryId().equals(entryId)) {
+      if (e.entryId().equals(entry.entryId())) {
         pending.remove(me.getKey());
         if (dead.size() >= MAX_DEAD_LETTERS) {
           dead.remove(dead.keySet().iterator().next());
         }
-        dead.put(me.getKey(), new Entry(e.entryId(), e.kind(), e.sub(), attempts, e.nextAttemptAt(), e.enqueuedAt(), lastOutcome));
+        dead.put(me.getKey(), new Entry(e.entryId(), e.kind(), e.sub(), e.aci(), attempts, e.nextAttemptAt(), e.enqueuedAt(), lastOutcome));
         return;
       }
     }
@@ -138,7 +138,7 @@ public class InMemoryEngineDeletionOutbox implements EngineDeletionOutbox {
       }
       final Entry e = me.getValue();
       dead.remove(me.getKey());
-      pending.put(me.getKey(), new Entry(e.entryId(), e.kind(), e.sub(), 0, now, e.enqueuedAt(), e.lastOutcome()));
+      pending.put(me.getKey(), new Entry(e.entryId(), e.kind(), e.sub(), e.aci(), 0, now, e.enqueuedAt(), e.lastOutcome()));
       moved++;
     }
     return moved;

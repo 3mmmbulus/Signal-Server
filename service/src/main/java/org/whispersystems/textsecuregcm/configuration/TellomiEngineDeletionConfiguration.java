@@ -20,7 +20,8 @@ import org.whispersystems.textsecuregcm.configuration.secrets.SecretBytes;
 /// **上线闸门（不要在生产打开 `enabled`，直到下面全部满足）：**
 /// 1. 法务回答了「删号时能不能把举报记录、证据截图、互动日志一起删」（设计文档 §LEGAL，owner: legal，待答）。引擎
 ///    现在的 `delete_account` 一律全删，包括别人对该用户内容的举报；需要保留的话要先改引擎，开关不能替法务做决定；
-/// 2. 待办队列换成持久实现（现在只在内存，重启就丢）；
+/// 2. 待办队列换成持久实现：配置 `outboxTableName`（DynamoDB 表，见 `DynamoDbEngineDeletionOutbox`；不配置 = 只在内存，重启就丢）。
+///    表要先建好并打开 TTL（属性 `X`），启动时会检查表是否存在；另外还缺对账作业（设计文档 §13）；
 /// 3. 引擎侧 `/internal` 在没配服务密钥时回 503 `service_disabled`（content-engine `bot/engine-internal-503-service-disabled`）。
 ///
 /// @param enabled              总开关，默认 `false`
@@ -37,6 +38,11 @@ import org.whispersystems.textsecuregcm.configuration.secrets.SecretBytes;
 /// @param secondDeleteDelay    第二次删除：账号删除后过这么久再删一次，默认 70 分钟（反馈凭证最长 1 小时有效，引擎不知道
 ///                             Signal 账号已经没了，旧凭证在这段时间里还能重新建主页等）。`PT0S` = 不做第二次删除。
 ///                             只在第一次删除成功之后才排；不超过 24 小时
+/// @param outboxTableName      持久待办表的名字（DynamoDB，主键 `S`，索引 `P-N`，TTL 属性 `X`，建表形状见
+///                             `DynamoDbEngineDeletionOutbox.createTableRequest`）。不配置 = 内存待办（不持久）。
+///                             配了以后 `maxPending` 不再起作用（DynamoDB 是上限，看 `pending` 指标报警）
+/// @param outboxTtl            持久待办每条的最长保留时间（含死信），默认 30 天（≥ 现在的删号保留窗口，之后 ACI 不会再被
+///                             回收，重送不会碰到新账号）；1 天到 400 天。只在配了 `outboxTableName` 时校验
 /// @param notFoundMeansDeleted 引擎回 404 / 410 算已删除，默认 `true`。注意：真实引擎在没配服务密钥时
 ///                             整个 `/internal` 路由是 404（`not_found`），这时 404 并不是「已删」，见设计文档第 5 节
 public record TellomiEngineDeletionConfiguration(boolean enabled,
@@ -50,7 +56,9 @@ public record TellomiEngineDeletionConfiguration(boolean enabled,
                                                  @Nullable Duration pollInterval,
                                                  @Nullable Integer maxPending,
                                                  @Nullable Duration secondDeleteDelay,
-                                                 @Nullable Boolean notFoundMeansDeleted) {
+                                                 @Nullable Boolean notFoundMeansDeleted,
+                                                 @Nullable String outboxTableName,
+                                                 @Nullable Duration outboxTtl) {
 
   public static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofSeconds(5);
   public static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(10);
@@ -63,7 +71,22 @@ public record TellomiEngineDeletionConfiguration(boolean enabled,
   public static final Duration DEFAULT_SECOND_DELETE_DELAY = Duration.ofMinutes(70);
   public static final Duration MAX_SECOND_DELETE_DELAY = Duration.ofHours(24);
 
+  /// not tied to the retention constants (which this class must not touch): only has to outlast the deleted-accounts
+  /// window, after which an ACI can no longer be recycled
+  public static final Duration DEFAULT_OUTBOX_TTL = Duration.ofDays(30);
+  public static final Duration MIN_OUTBOX_TTL = Duration.ofDays(1);
+  public static final Duration MAX_OUTBOX_TTL = Duration.ofDays(400);
+
   public static final int MIN_SERVICE_KEY_BYTES = 32;
+
+  /// the configuration as it was before the durable outbox existed (in-memory outbox)
+  public TellomiEngineDeletionConfiguration(boolean enabled, @Nullable String baseUrl, @Nullable SecretBytes serviceKey,
+      @Nullable Duration connectTimeout, @Nullable Duration requestTimeout, @Nullable Integer maxAttempts,
+      @Nullable Duration initialBackoff, @Nullable Duration maxBackoff, @Nullable Duration pollInterval,
+      @Nullable Integer maxPending, @Nullable Duration secondDeleteDelay, @Nullable Boolean notFoundMeansDeleted) {
+    this(enabled, baseUrl, serviceKey, connectTimeout, requestTimeout, maxAttempts, initialBackoff, maxBackoff,
+        pollInterval, maxPending, secondDeleteDelay, notFoundMeansDeleted, null, null);
+  }
 
   public TellomiEngineDeletionConfiguration {
     connectTimeout = connectTimeout == null ? DEFAULT_CONNECT_TIMEOUT : connectTimeout;
@@ -75,16 +98,28 @@ public record TellomiEngineDeletionConfiguration(boolean enabled,
     maxPending = maxPending == null ? DEFAULT_MAX_PENDING : maxPending;
     secondDeleteDelay = secondDeleteDelay == null ? DEFAULT_SECOND_DELETE_DELAY : secondDeleteDelay;
     notFoundMeansDeleted = notFoundMeansDeleted == null ? Boolean.TRUE : notFoundMeansDeleted;
+    outboxTableName = outboxTableName == null || outboxTableName.isBlank() ? null : outboxTableName.trim();
+    outboxTtl = outboxTtl == null ? DEFAULT_OUTBOX_TTL : outboxTtl;
 
     if (enabled) {
       validateEnabled(baseUrl, serviceKey, connectTimeout, requestTimeout, maxAttempts, initialBackoff, maxBackoff,
           pollInterval, maxPending, secondDeleteDelay);
+      if (outboxTableName != null
+          && (outboxTtl.compareTo(MIN_OUTBOX_TTL) < 0 || outboxTtl.compareTo(MAX_OUTBOX_TTL) > 0)) {
+        throw new IllegalArgumentException("tellomiEngineDeletion.outboxTtl must be between P1D and P400D");
+      }
     }
+  }
+
+  /// `true` when pending notices survive a restart (a table is configured)
+  public boolean durableOutbox() {
+    return outboxTableName != null;
   }
 
   /// 关着（缺省）的配置：什么都不做
   public static TellomiEngineDeletionConfiguration disabled() {
-    return new TellomiEngineDeletionConfiguration(false, null, null, null, null, null, null, null, null, null, null, null);
+    return new TellomiEngineDeletionConfiguration(false, null, null, null, null, null, null, null, null, null, null, null,
+        null, null);
   }
 
   private static void validateEnabled(@Nullable final String baseUrl, @Nullable final SecretBytes serviceKey,

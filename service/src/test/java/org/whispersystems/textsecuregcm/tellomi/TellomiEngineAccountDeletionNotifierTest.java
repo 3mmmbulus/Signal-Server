@@ -68,6 +68,10 @@ class TellomiEngineAccountDeletionNotifierTest {
   private final List<byte[]> sent = new ArrayList<>();
   private final List<Result> script = new ArrayList<>();
   private double jitter = 0.0;
+  // the live-account check: which ACIs have a live account again, and whether the lookup itself fails
+  private final java.util.Set<UUID> liveAccounts = new java.util.HashSet<>();
+  private final List<UUID> lookups = new ArrayList<>();
+  private boolean lookupFails = false;
 
   private final ListAppender<ILoggingEvent> logs = new ListAppender<>();
   private final List<Logger> attached = new ArrayList<>();
@@ -81,6 +85,12 @@ class TellomiEngineAccountDeletionNotifierTest {
     return new TellomiEngineAccountDeletionNotifier(c, pseudonym, box, sub -> {
       sent.add(sub);
       return script.isEmpty() ? new Result(Outcome.DELETED, 200, Optional.empty()) : script.removeFirst();
+    }, aci -> {
+      lookups.add(aci);
+      if (lookupFails) {
+        throw new IllegalStateException("account store down");
+      }
+      return liveAccounts.contains(aci);
     }, clock, () -> jitter, null);
   }
 
@@ -130,11 +140,12 @@ class TellomiEngineAccountDeletionNotifierTest {
   }
 
   @Test
-  void theOutboxHoldsThePseudonymNotTheAci() {
+  void theEntryHoldsTheAciForTheLiveCheckButNeverPrintsIt() {
     final UUID aci = UUID.randomUUID();
     notifier().onAccountDeleted(aci);
     final EngineDeletionOutbox.Entry entry = outbox.due(clock.instant(), 10).getFirst();
     assertThat(entry.sub()).isEqualTo(TOKENS.pseudonym(aci));
+    assertThat(entry.aci()).as("kept for the live-account check before a late send").isEqualTo(aci);
     assertThat(entry.toString()).doesNotContain(aci.toString());
   }
 
@@ -306,7 +317,7 @@ class TellomiEngineAccountDeletionNotifierTest {
     // 3. the outbox itself throws
     final EngineDeletionOutbox hostile = new InMemoryEngineDeletionOutbox(1) {
       @Override
-      public synchronized boolean enqueue(final byte[] sub, final Instant now) {
+      public synchronized boolean enqueue(final UUID aci, final byte[] sub, final Instant now) {
         throw new RuntimeException("storage down");
       }
     };
@@ -320,7 +331,7 @@ class TellomiEngineAccountDeletionNotifierTest {
     final TellomiEngineAccountDeletionNotifier n = new TellomiEngineAccountDeletionNotifier(config, TOKENS::pseudonym, outbox,
         sub -> {
           throw new IllegalStateException("bug");
-        }, clock, () -> 0.0, null);
+        }, aci -> false, clock, () -> 0.0, null);
     n.onAccountDeleted(UUID.randomUUID());
     n.drain();
     assertThat(outbox.pendingCount()).isEqualTo(1);
@@ -523,7 +534,7 @@ class TellomiEngineAccountDeletionNotifierTest {
   void failingToScheduleTheSecondDeleteNeverAffectsTheFirst() {
     final EngineDeletionOutbox hostile = new InMemoryEngineDeletionOutbox(10) {
       @Override
-      public synchronized boolean enqueueSweep(final byte[] sub, final Instant dueAt, final Instant enqueuedAt) {
+      public synchronized boolean enqueueSweep(final UUID aci, final byte[] sub, final Instant dueAt, final Instant enqueuedAt) {
         throw new RuntimeException("storage down");
       }
     };
@@ -547,7 +558,7 @@ class TellomiEngineAccountDeletionNotifierTest {
     n.onAccountDeleted(UUID.randomUUID());          // outbox full of sweeps: this one is dropped, not the sweeps
     assertThat(tiny.pendingCount()).isEqualTo(2);
     final byte[] sub = TOKENS.pseudonym(UUID.randomUUID());
-    assertThat(tiny.enqueueSweep(sub, clock.instant(), clock.instant())).isFalse();
+    assertThat(tiny.enqueueSweep(UUID.randomUUID(), sub, clock.instant(), clock.instant())).isFalse();
     assertThat(tiny.pendingCount()).isEqualTo(2);
   }
 
@@ -580,5 +591,178 @@ class TellomiEngineAccountDeletionNotifierTest {
         .doesNotContain(Base64.getUrlEncoder().withoutPadding().encodeToString(sub))
         .doesNotContain(Base64.getEncoder().encodeToString(sub)).doesNotContain(Arrays.toString(sub))
         .doesNotContain("engine.example.invalid").doesNotContain("Bearer");
+  }
+
+  // ---- live-account check before a late send (design doc §6.3 point 1, §13.5, HANDOFF §4(iii)) -------------------
+
+  @Test
+  void aPromptFirstDeleteIsSentEvenIfTheAciIsLiveAgain_erasureWins() {
+    final UUID aci = UUID.randomUUID();
+    liveAccounts.add(aci);                      // re-registered within seconds, before the first send
+    final TellomiEngineAccountDeletionNotifier n = notifier();
+    n.onAccountDeleted(aci);
+    clock.advance(Duration.ofSeconds(30));      // well inside the prompt window
+    n.drain();
+    assertThat(sent).as("the first delete goes out").hasSize(1);
+    assertThat(lookups).as("and is not subject to the check").isEmpty();
+  }
+
+  @Test
+  void aRetryAfterTheAciWasReRegisteredIsDroppedNotSent() {
+    final TellomiEngineAccountDeletionNotifier n = sweepNotifier();
+    final UUID aci = UUID.randomUUID();
+    script.add(r(Outcome.RETRY, 503));
+    n.onAccountDeleted(aci);
+    n.drain();                                  // first attempt: the engine is down
+    assertThat(sent).hasSize(1);
+    assertThat(outbox.pendingCount()).isEqualTo(1);
+
+    liveAccounts.add(aci);                      // the person registers again with the same number: same ACI
+    clock.advance(Duration.ofMinutes(5));
+    n.drain();
+
+    assertThat(sent).as("the retry would erase the new account's data").hasSize(1);
+    assertThat(lookups).containsExactly(aci);
+    assertThat(outbox.pendingCount()).as("dropped, and no second delete is scheduled for it").isZero();
+    assertThat(outbox.deadLetterCount()).isZero();
+  }
+
+  @Test
+  void aRetryForAnAciThatIsStillGoneIsSent_negativeControlOfTheDrop() {
+    final TellomiEngineAccountDeletionNotifier n = notifier();
+    final UUID aci = UUID.randomUUID();
+    script.add(r(Outcome.RETRY, 503));
+    n.onAccountDeleted(aci);
+    n.drain();
+    clock.advance(Duration.ofMinutes(5));
+    n.drain();
+    assertThat(lookups).containsExactly(aci);
+    assertThat(sent).as("checked, not live, so it goes out").hasSize(2);
+    assertThat(outbox.pendingCount()).isZero();
+  }
+
+  @Test
+  void aSecondDeleteForAReRegisteredAciIsDroppedEvenWhenTheCancelNeverReachedThisNode() {
+    final TellomiEngineAccountDeletionNotifier n = sweepNotifier();
+    final UUID aci = UUID.randomUUID();
+    n.onAccountDeleted(aci);
+    n.drain();
+    assertThat(sent).hasSize(1);
+
+    liveAccounts.add(aci);                      // re-registered on another node: onAccountCreatedWithRecycledAci never ran here
+    clock.advance(SECOND_DELETE);
+    n.drain();
+
+    assertThat(sent).as("the sweep did not erase the new account").hasSize(1);
+    assertThat(outbox.pendingCount()).isZero();
+  }
+
+  @Test
+  void aSecondDeleteForAnAciThatIsStillGoneIsSent() {
+    final TellomiEngineAccountDeletionNotifier n = sweepNotifier();
+    n.onAccountDeleted(UUID.randomUUID());
+    n.drain();
+    clock.advance(SECOND_DELETE);
+    n.drain();
+    assertThat(sent).hasSize(2);
+    assertThat(lookups).hasSize(1);
+  }
+
+  @Test
+  void anEntryThatWaitedOutAnOutageOrARestartIsChecked() {
+    final TellomiEngineAccountDeletionNotifier n = notifier();
+    final UUID aci = UUID.randomUUID();
+    n.onAccountDeleted(aci);                    // never attempted: the process was down
+    liveAccounts.add(aci);
+    clock.advance(TellomiEngineAccountDeletionNotifier.PROMPT_WINDOW.plusSeconds(1));
+    n.drain();
+    assertThat(sent).isEmpty();
+    assertThat(outbox.pendingCount()).isZero();
+
+    // the boundary: exactly the prompt window is still prompt
+    final UUID other = UUID.randomUUID();
+    liveAccounts.add(other);
+    n.onAccountDeleted(other);
+    clock.advance(TellomiEngineAccountDeletionNotifier.PROMPT_WINDOW);
+    n.drain();
+    assertThat(sent).hasSize(1);
+  }
+
+  @Test
+  void aRequeuedDeadLetterIsCheckedBeforeItIsSentAgain() {
+    final TellomiEngineAccountDeletionNotifier n = notifier();
+    final UUID aci = UUID.randomUUID();
+    script.add(r(Outcome.AUTH_FAILED, 401));
+    n.onAccountDeleted(aci);
+    n.drain();
+    assertThat(outbox.deadLetterCount()).isEqualTo(1);
+
+    liveAccounts.add(aci);                      // days later the operator fixes the key and requeues
+    clock.advance(Duration.ofDays(2));
+    assertThat(outbox.requeueDeadLetters(clock.instant())).isEqualTo(1);
+    n.drain();
+
+    assertThat(sent).as("only the first, failed attempt").hasSize(1);
+    assertThat(outbox.pendingCount()).isZero();
+    assertThat(outbox.deadLetterCount()).isZero();
+  }
+
+  @Test
+  void ifTheLookupFailsNothingIsSentAndTheEntryIsRetriedLater() {
+    final TellomiEngineAccountDeletionNotifier n = sweepNotifier();
+    n.onAccountDeleted(UUID.randomUUID());
+    n.drain();                                  // first delete delivered, the sweep is queued
+    clock.advance(SECOND_DELETE);
+
+    lookupFails = true;
+    n.drain();
+    assertThat(sent).as("cannot tell whether the account is live: do not send").hasSize(1);
+    assertThat(outbox.pendingCount()).isEqualTo(1);
+    assertThat(outbox.due(clock.instant(), 10)).as("backing off, not spinning").isEmpty();
+
+    lookupFails = false;
+    clock.advance(Duration.ofMinutes(5));
+    n.drain();
+    assertThat(sent).as("the store is back: not live, so it goes out").hasSize(2);
+    assertThat(outbox.pendingCount()).isZero();
+  }
+
+  @Test
+  void aLookupThatKeepsFailingEndsInTheDeadLetterNotInASend() {
+    final TellomiEngineAccountDeletionNotifier n = notifier();
+    script.add(r(Outcome.RETRY, 503));
+    n.onAccountDeleted(UUID.randomUUID());
+    n.drain();                                  // attempt 1 reached the engine
+    lookupFails = true;
+    for (int i = 0; i < 10; i++) {
+      clock.advance(Duration.ofMinutes(5));
+      n.drain();
+    }
+    assertThat(sent).hasSize(1);
+    assertThat(outbox.deadLetterCount()).isEqualTo(1);
+    assertThat(outbox.deadLetters().getFirst().lastOutcome()).isEqualTo("lookup_failed");
+  }
+
+  @Test
+  void theDroppedEntryLogsNoIdentifiers() {
+    final TellomiEngineAccountDeletionNotifier n = notifier();
+    final UUID aci = UUID.randomUUID();
+    final byte[] sub = TOKENS.pseudonym(aci);
+    script.add(r(Outcome.RETRY, 503));
+    n.onAccountDeleted(aci);
+    n.drain();
+    liveAccounts.add(aci);
+    clock.advance(Duration.ofMinutes(5));
+    n.drain();
+    lookupFails = true;
+    n.onAccountDeleted(UUID.randomUUID());
+    clock.advance(Duration.ofMinutes(5));
+    n.drain();
+
+    final String text = allLogText();
+    assertThat(text).contains("live again").contains("could not check");
+    assertThat(text).doesNotContain(aci.toString())
+        .doesNotContain(Base64.getUrlEncoder().withoutPadding().encodeToString(sub))
+        .doesNotContain(Arrays.toString(sub)).doesNotContain("account store down");
   }
 }

@@ -51,7 +51,7 @@ class TellomiEngineAccountDeletionEndToEndTest {
   private static TellomiEngineAccountDeletionNotifier notifier(final TellomiEngineDeletionConfiguration config,
       final InMemoryEngineDeletionOutbox outbox, final TestClock clock) {
     return new TellomiEngineAccountDeletionNotifier(config, TOKENS::pseudonym, outbox,
-        new EngineDeletionClient(config)::delete, clock, () -> 0.0, null);
+        new EngineDeletionClient(config)::delete, aci -> false, clock, () -> 0.0, null);
   }
 
   @Test

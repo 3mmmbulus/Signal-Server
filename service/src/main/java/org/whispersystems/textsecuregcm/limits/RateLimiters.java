@@ -77,7 +77,12 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     // 光靠按账号的限流不够（一个 IP 后面可以有很多账号），所以这时两个接口再按 IP 限一层。表载入后不用这两个。
     // 比按账号的宽一倍（运营商级 NAT 后面会有很多正常用户）；失败策略和按账号的一致。动态配置同样能调。
     TELLOMI_FEED_FRIEND_ASSERTION_IP("tellomiFeedFriendAssertionIp", new RateLimiterConfig(1200, Duration.ofSeconds(3), false)),
-    TELLOMI_FEED_AUDIENCE_LIST_IP("tellomiFeedAudienceListIp", new RateLimiterConfig(120, Duration.ofSeconds(10), true))
+    TELLOMI_FEED_AUDIENCE_LIST_IP("tellomiFeedAudienceListIp", new RateLimiterConfig(120, Duration.ofSeconds(10), true)),
+    // Tellomi（审计 SF-4）：GET /v1/tellomi/feed/auth。按调用者账号计。客户端把凭证缓存到 `expires_at` 前 5 分钟，正常一个设备
+    // 一小时取一次；这里只防「出错的客户端死循环反复取」。接口只是一次便宜的 HMAC、没有账号存在性探测，所以 Redis 不可用时
+    // 放行（failOpen = true，不能因为限流器挂了让所有人拿不到动态凭证）。桶 60、每 1 分钟回一个（一小时约 60 次，
+    // 足够多设备、重装、重试）。运行时可以用动态配置 limits.tellomiFeedAuth 调。
+    TELLOMI_FEED_AUTH("tellomiFeedAuth", new RateLimiterConfig(60, Duration.ofMinutes(1), true))
     ;
 
     private final String id;
@@ -274,6 +279,10 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
 
   public RateLimiter getTellomiFeedAudienceListLimiter() {
     return forDescriptor(For.TELLOMI_FEED_AUDIENCE_LIST);
+  }
+
+  public RateLimiter getTellomiFeedAuthLimiter() {
+    return forDescriptor(For.TELLOMI_FEED_AUTH);
   }
 
   public RateLimiter getTellomiFeedFriendAssertionIpLimiter() {

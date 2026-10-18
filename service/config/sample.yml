@@ -360,6 +360,14 @@ remoteConfig:
   globalConfig: # keys and values that are given to clients on GET /v1/config
     EXAMPLE_KEY: VALUE
 
+# Tellomi（ADR-0071 §8.8、F-14）：按账号下发 global.feed.enabled（动态入口）。可选；不配 = 服务端不碰这个键（客户端当作关）。
+# 配了就对每个账号下发 "true"/"false"：enabled 为真 + 账号 ACI 在 betaAcis 里 + 账号区域（+86 → cn，其余 → global）在 regions 里，才是 "true"。
+# 默认全是关；改这一段要重启服务（没有热加载）。betaAcis 和内容引擎的 beta_allowlist（假名）是两份。
+#tellomiFeedSwitch:
+#  enabled: false
+#  regions: [cn]            # cn / global
+#  betaAcis: []             # 账号 ACI 列表
+
 paymentsService:
   userAuthenticationTokenSharedSecret: secret://paymentsService.userAuthenticationTokenSharedSecret
   paymentCurrencies:

@@ -122,6 +122,7 @@ import org.whispersystems.textsecuregcm.captcha.TurnstileCaptchaClient;
 import org.whispersystems.textsecuregcm.configuration.AltchaCaptchaConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiEngineDeletionConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiFeedConfiguration;
+import org.whispersystems.textsecuregcm.configuration.TellomiFeedSwitchConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiReportsConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiRestrictionsConfiguration;
 import org.whispersystems.textsecuregcm.configuration.RegistrationRiskConfiguration;
@@ -308,6 +309,7 @@ import org.whispersystems.textsecuregcm.storage.PushChallengeDynamoDb;
 import org.whispersystems.textsecuregcm.storage.RedeemedReceiptsManager;
 import org.whispersystems.textsecuregcm.storage.RemoteConfigs;
 import org.whispersystems.textsecuregcm.storage.RemoteConfigsManager;
+import org.whispersystems.textsecuregcm.storage.TellomiFeedSwitch;
 import org.whispersystems.textsecuregcm.storage.RepeatedUseECSignedPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.RepeatedUseKEMSignedPreKeyStore;
 import org.whispersystems.textsecuregcm.storage.ReportMessageDynamoDb;
@@ -857,7 +859,12 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
             webAuthnCeremonyManager,
         // Tellomi (ADR-0066 §6.2): rename cooldown, 180 days unless usernamePolicy.renameCooldown says otherwise
         UsernamePolicyConfiguration.renameCooldown(config.getUsernamePolicyConfiguration()));
-    RemoteConfigsManager remoteConfigsManager = new RemoteConfigsManager(remoteConfigs, config.getRemoteConfigConfiguration().globalConfig());
+    // Tellomi（F-14）：配了 tellomiFeedSwitch 才由服务端按账号算 global.feed.enabled（HTTP /v2/config 和 gRPC 共用这一个 manager）
+    final TellomiFeedSwitchConfiguration tellomiFeedSwitchConfig = config.getTellomiFeedSwitchConfiguration();
+    final TellomiFeedSwitch tellomiFeedSwitch = tellomiFeedSwitchConfig == null ? null
+        : new TellomiFeedSwitch(tellomiFeedSwitchConfig, accountsManager::getByAccountIdentifier);
+    RemoteConfigsManager remoteConfigsManager = new RemoteConfigsManager(remoteConfigs,
+        config.getRemoteConfigConfiguration().globalConfig(), tellomiFeedSwitch);
     APNSender apnSender = new APNSender(apnSenderExecutor, Clock.systemUTC(), config.getApnConfiguration());
     FcmSender fcmSender = new FcmSender(fcmSenderExecutor, config.getFcmConfiguration().credentials().value());
     // Tellomi: 厂商推送（小米 / 华为，#941）；没配置的厂商 = 该类 token 视为未注册

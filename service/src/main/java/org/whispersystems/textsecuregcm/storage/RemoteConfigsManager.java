@@ -12,6 +12,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -32,6 +33,9 @@ public class RemoteConfigsManager {
 
   private final Supplier<List<RemoteConfig>> remoteConfigSupplier;
   private final Map<String, String> globalConfig;
+  /// Tellomi: null = 没配 tellomiFeedSwitch，`global.feed.enabled` 不碰
+  @Nullable
+  private final TellomiFeedSwitch tellomiFeedSwitch;
 
   private static final String GLOBAL_CONFIG_PREFIX = "global.";
   private static final Set<String> PLATFORM_PREFIXES = Arrays.stream(ClientPlatform.values())
@@ -39,9 +43,15 @@ public class RemoteConfigsManager {
       .collect(Collectors.toSet());
 
   public RemoteConfigsManager(final RemoteConfigs remoteConfigs, final Map<String, String> globalConfig) {
+    this(remoteConfigs, globalConfig, null);
+  }
+
+  public RemoteConfigsManager(final RemoteConfigs remoteConfigs, final Map<String, String> globalConfig,
+      @Nullable final TellomiFeedSwitch tellomiFeedSwitch) {
     this.remoteConfigSupplier =
         Suppliers.memoizeWithExpiration(remoteConfigs::getAll, 10, TimeUnit.SECONDS);
     this.globalConfig = globalConfig;
+    this.tellomiFeedSwitch = tellomiFeedSwitch;
   }
 
   /**
@@ -63,7 +73,7 @@ public class RemoteConfigsManager {
 
     final List<RemoteConfig> perPlatformConfig = remoteConfigSupplier.get();
 
-    return Stream.concat(
+    final Map<String, String> configs = Stream.concat(
             perPlatformConfig.stream()
                 .filter(config -> {
                   final String firstNameComponent = config.getName().split("\\.", 2)[0];
@@ -82,6 +92,18 @@ public class RemoteConfigsManager {
             globalConfig.entrySet().stream()
                 .map(e -> Pair.of(GLOBAL_CONFIG_PREFIX + e.getKey(), e.getValue())))
         .collect(Collectors.toMap(Pair::getLeft, Pair::getRight));
+
+    return tellomiFeedSwitch == null ? configs : withTellomiFeedSwitch(configs, accountIdentifier);
+  }
+
+  /// Tellomi（F-14）：配了 tellomiFeedSwitch 时，`global.feed.enabled` 由它按账号算，覆盖 globalConfig 里的同名值；
+  /// 算不出来（读账号出错）就不下发这个键，其余配置原样返回。HTTP `/v2/config` 和 gRPC 都经过这里。
+  private Map<String, String> withTellomiFeedSwitch(final Map<String, String> configs, final UUID accountIdentifier) {
+    final Map<String, String> result = new HashMap<>(configs);
+    tellomiFeedSwitch.valueFor(accountIdentifier).ifPresentOrElse(
+        value -> result.put(TellomiFeedSwitch.CONFIG_KEY, value),
+        () -> result.remove(TellomiFeedSwitch.CONFIG_KEY));
+    return result;
   }
 
   @Nullable

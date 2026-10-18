@@ -71,6 +71,7 @@ import org.whispersystems.textsecuregcm.configuration.TotpConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TurnConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiEngineDeletionConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiFeedConfiguration;
+import org.whispersystems.textsecuregcm.configuration.TellomiFeedSwitchConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiReportsConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiRestrictionsConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TurnstileCaptchaConfiguration;
@@ -335,6 +336,11 @@ public class WhisperServerConfiguration extends Configuration {
   @Valid
   @JsonProperty
   private TellomiFeedConfiguration tellomiFeed;
+
+  // Tellomi（ADR-0071 §8.8、F-14）：optional; absent = the server does not touch `global.feed.enabled` (clients treat missing as off)
+  @Valid
+  @JsonProperty
+  private TellomiFeedSwitchConfiguration tellomiFeedSwitch;
 
   // Tellomi（ADR-0071 §5.4、L2-5）：optional; absent or `enabled: false` = account deletion does not notify the content engine
   @Valid
@@ -659,6 +665,10 @@ public class WhisperServerConfiguration extends Configuration {
 
   public TellomiFeedConfiguration getTellomiFeedConfiguration() {
     return tellomiFeed;
+  }
+
+  public TellomiFeedSwitchConfiguration getTellomiFeedSwitchConfiguration() {
+    return tellomiFeedSwitch;
   }
 
   public TellomiReportsConfiguration getTellomiReportsConfiguration() {

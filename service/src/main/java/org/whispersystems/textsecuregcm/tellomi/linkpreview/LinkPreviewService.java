@@ -74,7 +74,8 @@ public final class LinkPreviewService {
     try {
       final LinkPreviewFetcher.Result result = fetcher.fetch(target);
       Metrics.counter(FETCH_COUNTER_NAME, "provider", provider, "outcome", result.outcome().name(),
-          "image", String.valueOf(result.card() != null && result.card().image() != null)).increment();
+          "image", String.valueOf(result.card() != null && result.card().image() != null),
+          "userAgent", result.userAgentUsed().name()).increment();
       if (result.card() != null) {
         positive.put(key, result.card());
         return new Answer.Found(result.card());

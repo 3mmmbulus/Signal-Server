@@ -17,8 +17,9 @@ import java.util.Set;
 /// - 页面主机精确匹配（不做通配）；重定向的每一跳都要还在**同一家**的页面主机里，不然这次作废（微博的访客验证页
 ///   `passport.weibo.com`、`visitor.passport.weibo.cn` 不在表里，所以访客墙 = 拿不到，不会去「过」它）。
 /// - 图片主机按后缀匹配（各家图床子域很多），只收 https。
-/// - UA：公众号用 iPhone Safari 的 UA（产品经理 2026-10-19 批准，ADR-0063 §3.4.1 的例外）；其余三家仍是 `WhatsApp/2`，
-///   换 UA 要另批。不带 cookie、不登录、不用私有接口、不解验证码。
+/// - UA：公众号默认用 iPhone Safari 的 UA（ADR-0063 §3.3 第 1 条的例外）；其余各家默认 `WhatsApp/2`。
+///   产品经理 2026-10-19 (4)：默认 UA 抓不到（没标题 / 403 / 登录或验证页）就自动用 Safari UA 重试一次，不再逐家审批
+///   （[LinkPreviewFetcher#fetch]）。不带 cookie、不登录、不用私有接口、不解验证码。
 public final class LinkPreviewProviders {
 
   public static final String WHATSAPP_UA = "WhatsApp/2";

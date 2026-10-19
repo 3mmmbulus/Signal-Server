@@ -26,6 +26,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import javax.imageio.ImageIO;
+import org.whispersystems.textsecuregcm.configuration.TellomiLinkPreviewConfiguration;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -37,6 +38,8 @@ class LinkPreviewFetcherTest {
   /// 记下每个请求（URL 和 UA），按 URL 回预设的响应
   static class FakeTransport implements LinkPreviewTransport {
     final Map<String, Object> routes = new HashMap<>();
+    /// 只对 Safari UA 生效的响应（没有就用 routes）
+    final Map<String, Object> safariRoutes = new HashMap<>();
     final List<String> requested = new ArrayList<>();
     final List<String> userAgents = new ArrayList<>();
 
@@ -45,7 +48,9 @@ class LinkPreviewFetcherTest {
         final Duration timeout, final String stopAfter) throws IOException {
       requested.add(uri.toString());
       userAgents.add(userAgent);
-      final Object r = routes.get(uri.toString());
+      final Object r = LinkPreviewProviders.SAFARI_UA.equals(userAgent) && safariRoutes.containsKey(uri.toString())
+          ? safariRoutes.get(uri.toString())
+          : routes.get(uri.toString());
       if (r instanceof IOException e) {
         throw e;
       }
@@ -70,6 +75,18 @@ class LinkPreviewFetcherTest {
 
     void image(final String url, final byte[] bytes) {
       routes.put(url, new Response(200, null, "image/jpeg", bytes, false));
+    }
+
+    void safariHtml(final String url, final String body) {
+      safariRoutes.put(url, new Response(200, null, "text/html; charset=utf-8", body.getBytes(StandardCharsets.UTF_8), false));
+    }
+
+    void status(final String url, final int status) {
+      routes.put(url, new Response(status, null, "text/html", new byte[0], false));
+    }
+
+    long pageRequests(final String url) {
+      return requested.stream().filter(url::equals).count();
     }
   }
 
@@ -161,7 +178,9 @@ class LinkPreviewFetcherTest {
     transport.redirect("https://m.weibo.cn/status/4154099588849643",
         "https://visitor.passport.weibo.cn/visitor/visitor?entry=sinawap");
     assertEquals(LinkPreviewFetcher.Outcome.LEFT_PROVIDER, fetch("https://m.weibo.cn/status/4154099588849643").outcome());
-    assertEquals(1, transport.requested.size());
+    // 默认 UA 一次、Safari 重试一次；两次都只请求白名单里的那一页，访客页本身从不请求
+    assertEquals(List.of("https://m.weibo.cn/status/4154099588849643", "https://m.weibo.cn/status/4154099588849643"),
+        transport.requested);
   }
 
   @Test
@@ -189,7 +208,8 @@ class LinkPreviewFetcherTest {
       transport.redirect("https://www.zhihu.com/r" + i, "/r" + (i + 1));
     }
     assertEquals(LinkPreviewFetcher.Outcome.LEFT_PROVIDER, fetch("https://www.zhihu.com/r0").outcome());
-    assertEquals(LinkPreviewFetcher.MAX_REDIRECTS + 1, transport.requested.size());
+    // 每一轮最多 MAX_REDIRECTS + 1 个请求；默认 UA 一轮、Safari 重试一轮
+    assertEquals(2 * (LinkPreviewFetcher.MAX_REDIRECTS + 1), transport.requested.size());
   }
 
   @Test
@@ -222,10 +242,14 @@ class LinkPreviewFetcherTest {
   void douyinShellTitleIsGeneric() {
     transport.redirect("https://v.douyin.com/8rmc2PU/", "https://www.iesdouyin.com/share/video/6957891939144322307/?region=CN&u_code=x");
     transport.html("https://www.iesdouyin.com/share/video/6957891939144322307/", "<title>在抖音记录美好生活20261019 - 抖音</title>");
-    assertEquals(LinkPreviewFetcher.Outcome.NO_TITLE, fetch("https://v.douyin.com/8rmc2PU/").outcome());
-    // 去参数后的地址才发出去（u_code 能认出分享者）
-    assertEquals(List.of("https://v.douyin.com/8rmc2PU/", "https://www.iesdouyin.com/share/video/6957891939144322307/"),
-        transport.requested);
+    final LinkPreviewFetcher.Result r = fetch("https://v.douyin.com/8rmc2PU/");
+    assertEquals(LinkPreviewFetcher.Outcome.NO_TITLE, r.outcome());
+    // 去参数后的地址才发出去（u_code 能认出分享者）；默认 UA 一轮、Safari 重试一轮
+    final List<String> oneRound = List.of("https://v.douyin.com/8rmc2PU/", "https://www.iesdouyin.com/share/video/6957891939144322307/");
+    final List<String> both = new ArrayList<>(oneRound);
+    both.addAll(oneRound);
+    assertEquals(both, transport.requested);
+    assertEquals(2, r.attempts());
   }
 
   @Test
@@ -294,5 +318,120 @@ class LinkPreviewFetcherTest {
     final LinkPreviewTransport.Response whole = LinkPreviewTransport.readLimited(200, null, null,
         new ByteArrayInputStream(body), 1000, null);
     assertFalse(whole.truncated());
+  }
+
+  // ---- 换 UA 重试一次（产品经理 2026-10-19 (4)）----
+
+  private static final String ZH = "https://www.zhihu.com/question/640359835";
+  private static final String ZH_IMG = "https://pic1.zhimg.com/v2-abc.jpg";
+
+  @Test
+  void noTitleWithTheDefaultUaThenSafariGivesTheCard() throws Exception {
+    transport.html(ZH, "<title>知乎 - 有问题，就会有答案</title>");
+    transport.safariHtml(ZH, "<meta property=\"og:title\" content=\"真问题\"><meta property=\"og:image\" content=\"" + ZH_IMG + "\">");
+    transport.image(ZH_IMG, png(400, 300));
+    final LinkPreviewFetcher.Result r = fetch(ZH);
+    assertEquals(LinkPreviewFetcher.Outcome.OK, r.outcome());
+    assertEquals("真问题", r.card().title());
+    assertNotNull(r.card().image());
+    assertEquals(LinkPreviewFetcher.UserAgentUsed.SAFARI_RETRY, r.userAgentUsed());
+    assertEquals(2, r.attempts());
+    assertEquals(List.of(ZH, ZH, ZH_IMG), transport.requested);
+    assertEquals(List.of("WhatsApp/2", LinkPreviewProviders.SAFARI_UA, LinkPreviewProviders.SAFARI_UA), transport.userAgents,
+        "图片用抓成功那次的 UA");
+  }
+
+  @Test
+  void a403WithTheDefaultUaThenSafariGivesTheCard() {
+    transport.status(ZH, 403);
+    transport.safariHtml(ZH, "<title>一个回答 - 知乎</title>");
+    final LinkPreviewFetcher.Result r = fetch(ZH);
+    assertEquals(LinkPreviewFetcher.Outcome.OK, r.outcome());
+    assertEquals("一个回答 - 知乎", r.card().title());
+    assertEquals(LinkPreviewFetcher.UserAgentUsed.SAFARI_RETRY, r.userAgentUsed());
+  }
+
+  @Test
+  void aLoginRedirectWithTheDefaultUaThenSafariGivesTheCard() {
+    final String item = "https://detail.tmall.com/item.htm?id=1";
+    transport.redirect(item, "https://login.taobao.com/member/login.jhtml");
+    transport.safariHtml(item, "<title>某某旗舰店 新款外套-tmall.com天猫</title>");
+    final LinkPreviewFetcher.Result r = fetch(item);
+    assertEquals(LinkPreviewFetcher.Outcome.OK, r.outcome());
+    assertEquals(LinkPreviewFetcher.UserAgentUsed.SAFARI_RETRY, r.userAgentUsed());
+  }
+
+  @Test
+  void bothUasFailMeansNoCardSoTheClientShowsTheBrandShell() {
+    transport.status(ZH, 403);
+    final LinkPreviewFetcher.Result r = fetch(ZH);
+    assertEquals(LinkPreviewFetcher.Outcome.HTTP_STATUS, r.outcome());
+    assertNull(r.card());
+    assertEquals(LinkPreviewFetcher.UserAgentUsed.SAFARI_RETRY, r.userAgentUsed());
+    assertEquals(2, r.attempts());
+
+    final LinkPreviewService service = new LinkPreviewService(fetcher,
+        new TellomiLinkPreviewConfiguration(true, null, null, null, null));
+    final String other = "https://zhuanlan.zhihu.com/p/1";
+    transport.html(other, "<title>知乎 - 有问题，就会有答案</title>");
+    assertTrue(service.preview(LinkPreviewUrls.parse(other).orElseThrow()) instanceof LinkPreviewService.Answer.NotAvailable,
+        "两次都失败 = 没有卡片（204），客户端出品牌壳");
+  }
+
+  @Test
+  void theRetryHappensExactlyOnce() {
+    transport.status(ZH, 403);
+    fetch(ZH);
+    assertEquals(2, transport.pageRequests(ZH), "默认 UA 一次 + Safari 一次，不再多");
+    assertEquals(List.of("WhatsApp/2", LinkPreviewProviders.SAFARI_UA), transport.userAgents);
+
+    transport.requested.clear();
+    transport.userAgents.clear();
+    transport.html(ZH, "<title>知乎</title>");
+    final LinkPreviewFetcher.Result r = fetch(ZH);
+    assertEquals(LinkPreviewFetcher.Outcome.NO_TITLE, r.outcome());
+    assertEquals(2, transport.pageRequests(ZH));
+  }
+
+  @Test
+  void noRetryWhenTheDefaultUaWorksOrIsAlreadySafari() {
+    transport.html(ZH, "<title>一个回答 - 知乎</title>");
+    final LinkPreviewFetcher.Result ok = fetch(ZH);
+    assertEquals(LinkPreviewFetcher.UserAgentUsed.DEFAULT, ok.userAgentUsed());
+    assertEquals(1, ok.attempts());
+    assertEquals(1, transport.pageRequests(ZH));
+
+    transport.html(WX, "<title>微信公众平台</title>");
+    final LinkPreviewFetcher.Result wx = fetch(WX);
+    assertEquals(LinkPreviewFetcher.Outcome.NO_TITLE, wx.outcome());
+    assertEquals(1, wx.attempts(), "公众号默认就是 Safari，不重试");
+    assertEquals(1, transport.pageRequests(WX));
+  }
+
+  @Test
+  void noRetryForOtherFailures() {
+    transport.status(ZH, 404);
+    assertEquals(1, fetch(ZH).attempts(), "404 不重试");
+    transport.routes.put(ZH, new IOException("reset"));
+    assertEquals(LinkPreviewFetcher.Outcome.NETWORK, fetch(ZH).outcome());
+    assertEquals(1, fetch(ZH).attempts(), "网络错误不重试");
+    dns.put("www.zhihu.com", "10.0.0.1");
+    final LinkPreviewFetcher.Result forbidden = fetch(ZH);
+    assertEquals(LinkPreviewFetcher.Outcome.FORBIDDEN_ADDRESS, forbidden.outcome());
+    assertEquals(1, forbidden.attempts(), "内网地址不重试");
+  }
+
+  @Test
+  void retryRulesAsATable() {
+    final LinkPreviewProviders.Provider zhihu = LinkPreviewProviders.ZHIHU;
+    assertTrue(LinkPreviewFetcher.shouldRetryWithSafari(zhihu, LinkPreviewFetcher.Outcome.NO_TITLE, 200));
+    assertTrue(LinkPreviewFetcher.shouldRetryWithSafari(zhihu, LinkPreviewFetcher.Outcome.LEFT_PROVIDER, 302));
+    assertTrue(LinkPreviewFetcher.shouldRetryWithSafari(zhihu, LinkPreviewFetcher.Outcome.HTTP_STATUS, 403));
+    assertFalse(LinkPreviewFetcher.shouldRetryWithSafari(zhihu, LinkPreviewFetcher.Outcome.HTTP_STATUS, 404));
+    assertFalse(LinkPreviewFetcher.shouldRetryWithSafari(zhihu, LinkPreviewFetcher.Outcome.HTTP_STATUS, 500));
+    assertFalse(LinkPreviewFetcher.shouldRetryWithSafari(zhihu, LinkPreviewFetcher.Outcome.TIMEOUT, 0));
+    assertFalse(LinkPreviewFetcher.shouldRetryWithSafari(zhihu, LinkPreviewFetcher.Outcome.NOT_HTML, 200));
+    assertFalse(LinkPreviewFetcher.shouldRetryWithSafari(LinkPreviewProviders.WEIXIN_MP, LinkPreviewFetcher.Outcome.NO_TITLE, 200));
+    assertFalse(LinkPreviewFetcher.shouldRetryWithSafari(zhihu, LinkPreviewFetcher.Outcome.OK, 200));
   }
 }

@@ -72,6 +72,7 @@ import org.whispersystems.textsecuregcm.configuration.TurnConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiEngineDeletionConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiFeedConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiReportsConfiguration;
+import org.whispersystems.textsecuregcm.configuration.TellomiLinkPreviewConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiRestrictionsConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TurnstileCaptchaConfiguration;
 import org.whispersystems.textsecuregcm.configuration.UsernamePolicyConfiguration;
@@ -355,6 +356,11 @@ public class WhisperServerConfiguration extends Configuration {
   @Valid
   @JsonProperty
   private TellomiRestrictionsConfiguration tellomiRestrictions;
+
+  // Tellomi（ADR-0063 §6.5）：optional; absent or `enabled: false` = no POST /v1/tellomi/link-preview (server-side link cards)
+  @Valid
+  @JsonProperty
+  private TellomiLinkPreviewConfiguration tellomiLinkPreview;
 
   @Valid
   @NotNull
@@ -663,6 +669,10 @@ public class WhisperServerConfiguration extends Configuration {
 
   public TellomiReportsConfiguration getTellomiReportsConfiguration() {
     return tellomiReports;
+  }
+
+  public TellomiLinkPreviewConfiguration getTellomiLinkPreviewConfiguration() {
+    return tellomiLinkPreview;
   }
 
   public TellomiRestrictionsConfiguration getTellomiRestrictionsConfiguration() {

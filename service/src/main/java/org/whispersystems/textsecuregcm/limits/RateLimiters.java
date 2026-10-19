@@ -91,7 +91,11 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
     // 一小时取一次；这里只防「出错的客户端死循环反复取」。接口只是一次便宜的 HMAC、没有账号存在性探测，所以 Redis 不可用时
     // 放行（failOpen = true，不能因为限流器挂了让所有人拿不到动态凭证）。桶 60、每 1 分钟回一个（一小时约 60 次，
     // 足够多设备、重装、重试）。运行时可以用动态配置 limits.tellomiFeedAuth 调。
-    TELLOMI_FEED_AUTH("tellomiFeedAuth", new RateLimiterConfig(60, Duration.ofMinutes(1), true))
+    TELLOMI_FEED_AUTH("tellomiFeedAuth", new RateLimiterConfig(60, Duration.ofMinutes(1), true)),
+    // Tellomi（ADR-0063 §6.5.5）：POST /v1/tellomi/link-preview，服务端代抓白名单站点的链接卡片。按调用者账号计：先给 20 次，
+    // 之后每 30 秒回一次（一小时约 120 次，正常聊天远用不到）。防的是把服务端当免费抓取器用。只存次数、不带 URL。
+    // Redis 不可用时拒绝（failOpen = false）：宁可这一阵没有服务端卡片，也不让抓取不受控。动态配置 limits.tellomiLinkPreview 可调。
+    TELLOMI_LINK_PREVIEW("tellomiLinkPreview", new RateLimiterConfig(20, Duration.ofSeconds(30), false))
     ;
 
     private final String id;
@@ -300,6 +304,10 @@ public class RateLimiters extends BaseRateLimiters<RateLimiters.For> {
 
   public RateLimiter getTellomiFeedAudienceListIpLimiter() {
     return forDescriptor(For.TELLOMI_FEED_AUDIENCE_LIST_IP);
+  }
+
+  public RateLimiter getTellomiLinkPreviewLimiter() {
+    return forDescriptor(For.TELLOMI_LINK_PREVIEW);
   }
 
   public RateLimiter getTellomiReportSpamLimiter() {

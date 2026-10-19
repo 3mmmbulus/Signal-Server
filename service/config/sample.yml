@@ -36,6 +36,18 @@ tlsKeyStore:
 #   secondDeleteDelay: PT70M                          # repeat delete after the feed credentials (<= 1h) have expired; PT0S = off
 #   notFoundMeansDeleted: true
 
+# Tellomi (ADR-0063 section 6.5): server-side link cards for the whitelisted sites a phone cannot fetch
+# (mp.weixin.qq.com, zhihu, weibo, xiaohongshu, douyin, taobao / tmall item pages; the list is compiled in
+# LinkPreviewProviders, not configurable). OFF by default: absent or enabled: false = POST /v1/tellomi/link-preview is not
+# registered. No logging of URLs; in-memory cache keyed by SHA-256(URL) only. Turning it on in production needs the
+# owner's go-ahead and the privacy policy text (product manager) published the same day.
+# tellomiLinkPreview:
+#   enabled: false
+#   cacheTtl: PT10M             # max PT1H
+#   negativeCacheTtl: PT2M      # max PT10M
+#   cacheMaxEntries: 2000
+#   maxConcurrentFetches: 8
+
 stripe:
   apiKey: secret://stripe.apiKey
   idempotencyKeyGenerator: secret://stripe.idempotencyKeyGenerator

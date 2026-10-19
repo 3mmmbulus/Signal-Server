@@ -122,6 +122,13 @@ import org.whispersystems.textsecuregcm.captcha.TurnstileCaptchaClient;
 import org.whispersystems.textsecuregcm.configuration.AltchaCaptchaConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiEngineDeletionConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiFeedConfiguration;
+import org.whispersystems.textsecuregcm.configuration.TellomiLinkPreviewConfiguration;
+import org.whispersystems.textsecuregcm.controllers.TellomiLinkPreviewController;
+import org.whispersystems.textsecuregcm.tellomi.linkpreview.AddressGuard;
+import org.whispersystems.textsecuregcm.tellomi.linkpreview.LinkPreviewFetcher;
+import org.whispersystems.textsecuregcm.tellomi.linkpreview.LinkPreviewProviders;
+import org.whispersystems.textsecuregcm.tellomi.linkpreview.LinkPreviewService;
+import org.whispersystems.textsecuregcm.tellomi.linkpreview.LinkPreviewTransport;
 import org.whispersystems.textsecuregcm.configuration.TellomiReportsConfiguration;
 import org.whispersystems.textsecuregcm.configuration.TellomiRestrictionsConfiguration;
 import org.whispersystems.textsecuregcm.configuration.RegistrationRiskConfiguration;
@@ -1477,6 +1484,28 @@ public class WhisperServerService extends Application<WhisperServerConfiguration
           tellomiFeedConfig.cnHostSuffixes(), asnInfoProviderSupplier, clock);
       environment.jersey().register(tellomiFeedController);
       webSocketEnvironment.jersey().register(tellomiFeedController);
+    }
+
+    // Tellomi（ADR-0063 §6.5，owner 2026-10-19）：服务端代抓白名单几家（公众号、知乎、微博、小红书、抖音、淘宝 / 天猫商品页）的链接卡片。默认关：
+    // 不配或 enabled: false 时路由不注册（客户端拿到 404 就照旧本机抓 / 品牌壳）。抓取在自己的线程池里，最多
+    // maxConcurrentFetches 个同时进行；不记日志、缓存只在内存（LinkPreviewService）。
+    final TellomiLinkPreviewConfiguration tellomiLinkPreviewConfig = config.getTellomiLinkPreviewConfiguration();
+    if (tellomiLinkPreviewConfig != null && tellomiLinkPreviewConfig.enabled()) {
+      final int linkPreviewThreads = tellomiLinkPreviewConfig.maxConcurrentFetchesOrDefault();
+      final ExecutorService linkPreviewExecutor = ExecutorServiceBuilder.of(environment, "tellomiLinkPreview")
+          .minThreads(linkPreviewThreads)
+          .maxThreads(linkPreviewThreads)
+          .allowCoreThreadTimeOut(true)
+          .workQueue(new ArrayBlockingQueue<>(linkPreviewThreads * 4))
+          .build();
+      final LinkPreviewService linkPreviewService = new LinkPreviewService(
+          new LinkPreviewFetcher(new LinkPreviewTransport.Jdk(Duration.ofSeconds(5)), AddressGuard.SYSTEM, clock),
+          tellomiLinkPreviewConfig);
+      final TellomiLinkPreviewController linkPreviewController =
+          new TellomiLinkPreviewController(rateLimiters, linkPreviewService, linkPreviewExecutor);
+      environment.jersey().register(linkPreviewController);
+      webSocketEnvironment.jersey().register(linkPreviewController);
+      log.info("Tellomi: server-side link previews enabled for {} providers", LinkPreviewProviders.ALL.size());
     }
 
     // Tellomi（ADR-0071 §5.4、L2-5）：账号删除后通知内容引擎删数据。默认关；开着时要求配了 tellomiFeed（假名密钥）。

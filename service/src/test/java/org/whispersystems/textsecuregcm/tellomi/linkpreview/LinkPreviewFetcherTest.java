@@ -434,4 +434,73 @@ class LinkPreviewFetcherTest {
     assertFalse(LinkPreviewFetcher.shouldRetryWithSafari(LinkPreviewProviders.WEIXIN_MP, LinkPreviewFetcher.Outcome.NO_TITLE, 200));
     assertFalse(LinkPreviewFetcher.shouldRetryWithSafari(zhihu, LinkPreviewFetcher.Outcome.OK, 200));
   }
+
+  private static final String TB = "https://item.taobao.com/item.htm?id=674169489573";
+  private static final String TB_IMG = "https://img.alicdn.com/i1/a.jpg";
+
+  @Test
+  void aPlaceholderTitleWithoutAnImageAfterTheSafariRetryIsNoCard() {
+    // 2026-10-19 成都出口：WhatsApp/2 没标题，Safari 拿到 `<title>商品详情页</title>`、没有图
+    transport.html(TB, "<head></head>");
+    transport.safariHtml(TB, "<title>商品详情页</title>");
+    final LinkPreviewFetcher.Result r = fetch(TB);
+    assertEquals(LinkPreviewFetcher.Outcome.NO_TITLE, r.outcome());
+    assertNull(r.card());
+    assertEquals(LinkPreviewFetcher.UserAgentUsed.SAFARI_RETRY, r.userAgentUsed());
+    assertEquals(2, r.attempts());
+    assertEquals(2, transport.pageRequests(TB), "只重试一次");
+
+    final LinkPreviewService service = new LinkPreviewService(fetcher,
+        new TellomiLinkPreviewConfiguration(true, null, null, null, null));
+    final String other = "https://detail.tmall.com/item.htm?id=540349415064";
+    transport.html(other, "<title> 商品详情页 </title>");
+    assertTrue(service.preview(LinkPreviewUrls.parse(other).orElseThrow()) instanceof LinkPreviewService.Answer.NotAvailable,
+        "占位标题 + 没图 = 没有卡片（204），客户端出品牌壳");
+  }
+
+  @Test
+  void aPlaceholderTitleWithTheDefaultUaTriggersTheSafariRetry() {
+    transport.html(TB, "<title>商品详情页</title>");
+    transport.safariHtml(TB, "<title>某某店 新款外套-淘宝网</title>");
+    final LinkPreviewFetcher.Result r = fetch(TB);
+    assertEquals(LinkPreviewFetcher.Outcome.OK, r.outcome());
+    assertEquals("某某店 新款外套-淘宝网", r.card().title());
+    assertEquals(LinkPreviewFetcher.UserAgentUsed.SAFARI_RETRY, r.userAgentUsed());
+    assertEquals(List.of("WhatsApp/2", LinkPreviewProviders.SAFARI_UA), transport.userAgents);
+  }
+
+  @Test
+  void aPlaceholderTitleWithARealImageIsStillACard() throws Exception {
+    transport.html(TB, "<title>商品详情页</title><meta property=\"og:image\" content=\"" + TB_IMG + "\">");
+    transport.image(TB_IMG, png(800, 800));
+    final LinkPreviewFetcher.Result r = fetch(TB);
+    assertEquals(LinkPreviewFetcher.Outcome.OK, r.outcome());
+    assertEquals("商品详情页", r.card().title());
+    assertNotNull(r.card().image());
+    assertEquals(1, r.attempts());
+  }
+
+  @Test
+  void aPlaceholderTitleWhoseImageFailsCountsAsNoTitle() {
+    transport.html(TB, "<title>商品详情页</title><meta property=\"og:image\" content=\"" + TB_IMG + "\">");
+    // 图片 404（FakeTransport 默认）
+    final LinkPreviewFetcher.Result r = fetch(TB);
+    assertEquals(LinkPreviewFetcher.Outcome.NO_TITLE, r.outcome());
+    assertEquals(2, r.attempts());
+  }
+
+  @Test
+  void placeholderTitlesArePerProvider() {
+    assertTrue(LinkPreviewProviders.TAOBAO.isPlaceholderTitle("商品详情页"));
+    assertTrue(LinkPreviewProviders.TAOBAO.isPlaceholderTitle("  商品详情页\n"));
+    assertTrue(LinkPreviewProviders.TMALL.isPlaceholderTitle("商品详情页"));
+    assertFalse(LinkPreviewProviders.TAOBAO.isPlaceholderTitle("商品详情页 - 某某旗舰店新款外套"));
+    assertFalse(LinkPreviewProviders.ZHIHU.isPlaceholderTitle("商品详情页"));
+    assertFalse(LinkPreviewProviders.WEIXIN_MP.isPlaceholderTitle("商品详情页"));
+    for (final LinkPreviewProviders.Provider p : LinkPreviewProviders.ALL) {
+      if (p != LinkPreviewProviders.TAOBAO && p != LinkPreviewProviders.TMALL) {
+        assertTrue(p.placeholderTitles().isEmpty(), p.id());
+      }
+    }
+  }
 }

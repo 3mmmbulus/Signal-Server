@@ -29,6 +29,9 @@ import javax.annotation.Nullable;
 /// 403、或被送去登录 / 验证码 / 访客页（[Outcome#LEFT_PROVIDER]）——就用手机 Safari 的 UA 从头再抓**一次**，
 /// 共用同一个 10 s 预算（剩下不到 [#MIN_RETRY_BUDGET] 就不重试）。还是不行就是没有卡片（客户端出品牌壳）。
 /// 默认 UA 已经是 Safari 的（公众号）不重试；超时、网络错误、内网地址、不是 HTML 不重试。图片用抓成功那次的 UA。
+///
+/// **占位标题**（2026-10-19 成都出口实测）：标题是这家的占位标题（[LinkPreviewProviders.Provider#placeholderTitles]，
+/// 比如淘宝 / 天猫的「商品详情页」）**而且没拿到图**，算 [Outcome#NO_TITLE]——还没重试就换 Safari 重试，重试过了就没有卡片。
 public final class LinkPreviewFetcher {
 
   public static final int MAX_HTML_BYTES = 1024 * 1024;
@@ -171,6 +174,10 @@ public final class LinkPreviewFetcher {
       final Optional<URI> imageUri = LinkPreviewUrls.imageUri(provider, current, meta.ogImage());
       if (imageUri.isPresent() && remaining(deadline).compareTo(MIN_IMAGE_BUDGET) >= 0) {
         image = fetchImage(userAgent, imageUri.get(), deadline);
+      }
+      if (image == null && provider.isPlaceholderTitle(title)) {
+        // 「商品详情页」这类模板标题又没有图 = 跟品牌壳一样，不当卡片（会触发 Safari 重试；重试过了就 204）
+        return new Attempt(Result.failed(Outcome.NO_TITLE), lastStatus);
       }
       return new Attempt(new Result(Outcome.OK, new Card(title, target.uri().getHost(), provider.id(), image)), lastStatus);
     } catch (final AddressGuard.ForbiddenAddressException e) {

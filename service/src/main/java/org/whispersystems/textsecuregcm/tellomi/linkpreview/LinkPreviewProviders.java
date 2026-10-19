@@ -33,8 +33,19 @@ public final class LinkPreviewProviders {
   /// @param stripParams        抓取前删掉的查询参数（分享者标识、追踪参数）；`*` 结尾表示前缀
   /// @param blockedPathPrefixes 落到这些路径（登录、验证码、404 页）= 拿不到
   /// @param genericTitles      站点级的通用标题（不是这条内容的）= 当作没标题；`*` 结尾表示前缀
+  /// @param placeholderTitles  占位标题：页面模板的标题（比如淘宝 / 天猫的「商品详情页」），**又没有图**时当作没标题
+  ///                           （会触发 Safari 重试；重试过了就是没有卡片 → 204 → 品牌壳）。有图时照常出卡。
+  ///                           精确匹配（去掉首尾空白）；`*` 结尾表示前缀。2026-10-19 成都出口实测加的。
   public record Provider(String id, Set<String> pageHosts, Set<String> imageHostSuffixes, String userAgent,
-                         List<String> stripParams, List<String> blockedPathPrefixes, Set<String> genericTitles) {
+                         List<String> stripParams, List<String> blockedPathPrefixes, Set<String> genericTitles,
+                         Set<String> placeholderTitles) {
+
+    /// 没有占位标题的旧写法
+    public Provider(final String id, final Set<String> pageHosts, final Set<String> imageHostSuffixes,
+        final String userAgent, final List<String> stripParams, final List<String> blockedPathPrefixes,
+        final Set<String> genericTitles) {
+      this(id, pageHosts, imageHostSuffixes, userAgent, stripParams, blockedPathPrefixes, genericTitles, Set.of());
+    }
 
     public boolean isPageHost(final String host) {
       return pageHosts.contains(host.toLowerCase(Locale.ROOT));
@@ -63,6 +74,16 @@ public final class LinkPreviewProviders {
     public boolean isGenericTitle(final String title) {
       for (final String g : genericTitles) {
         if (g.endsWith("*") ? title.startsWith(g.substring(0, g.length() - 1)) : title.equals(g)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    public boolean isPlaceholderTitle(final String title) {
+      final String t = title.strip();
+      for (final String g : placeholderTitles) {
+        if (g.endsWith("*") ? t.startsWith(g.substring(0, g.length() - 1)) : t.equals(g)) {
           return true;
         }
       }
@@ -116,7 +137,7 @@ public final class LinkPreviewProviders {
       Set.of("小红书", "小红书 - 你访问的页面不见了", "小红书 - 你的生活指南", "小红书_沪ICP备13030189号"));
 
   /// 抖音：`v.douyin.com` 短链 302 到 `www.iesdouyin.com/share/video/…` 或 `www.douyin.com/video/…`，都在表里。
-  /// 2026-10-19 东京出口：页面是 JS 壳，只有「在抖音记录美好生活… - 抖音」这种通用标题（当作没标题）——大陆出口待测。
+  /// 2026-10-19 东京出口：页面是 JS 壳，只有「在抖音记录美好生活… - 抖音」这种通用标题（当作没标题）；2026-10-19 成都阿里云出口同样 3/3 没标题。
   public static final Provider DOUYIN = new Provider("douyin",
       Set.of("www.douyin.com", "douyin.com", "www.iesdouyin.com", "iesdouyin.com", "v.douyin.com", "live.douyin.com"),
       Set.of("douyinpic.com", "douyinstatic.com"),
@@ -136,7 +157,9 @@ public final class LinkPreviewProviders {
           "shareUniqueId", "sourceType", "un", "share_crt_v", "un_site", "ut_sk", "sp_tk", "cpp", "shareurl",
           "short_name", "bxsign", "app", "tbSocialPopKey", "wxsign", "price", "stats_click", "utm_*"),
       List.of("/login", "/member/login", "/punish", "/404"),
-      Set.of("淘宝", "淘宝网", "淘宝网 - 淘！我喜欢", "手机淘宝网", "商品详情", "宝贝详情", "验证码拦截"));
+      Set.of("淘宝", "淘宝网", "淘宝网 - 淘！我喜欢", "手机淘宝网", "商品详情", "宝贝详情", "验证码拦截"),
+      // 2026-10-19 成都出口：Safari 拿到的是 `<title>商品详情页</title>`、没有 og:image —— 模板标题，不是这件商品
+      Set.of("商品详情页", "宝贝详情页"));
 
   /// 天猫商品页（天猫超市同理）。天猫的 App 分享走 m.tb.cn（见淘宝）。
   public static final Provider TMALL = new Provider("tmall",
@@ -145,7 +168,9 @@ public final class LinkPreviewProviders {
       WHATSAPP_UA,
       List.of("spm", "tbpm", "_u", "skuId", "ali_refid", "ali_trackid", "scm", "pvid", "utparam", "from", "utm_*"),
       List.of("/login", "/punish", "/404"),
-      Set.of("天猫", "天猫tmall.com", "天猫Tmall.com--理想生活上天猫", "商品详情", "验证码拦截"));
+      Set.of("天猫", "天猫tmall.com", "天猫Tmall.com--理想生活上天猫", "商品详情", "验证码拦截"),
+      // 同一套商品详情模板（与淘宝同口径）
+      Set.of("商品详情页", "宝贝详情页"));
 
   public static final List<Provider> ALL = List.of(WEIXIN_MP, ZHIHU, WEIBO, XIAOHONGSHU, DOUYIN, TAOBAO, TMALL);
 

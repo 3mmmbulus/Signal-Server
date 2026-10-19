@@ -8,6 +8,9 @@ package org.whispersystems.textsecuregcm.push;
 import static org.whispersystems.textsecuregcm.metrics.MetricsUtil.name;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.google.api.client.http.HostRewritingHttpTransport;
+import com.google.api.client.http.HttpTransport;
+import com.google.api.client.http.javanet.NetHttpTransport;
 import com.google.auth.oauth2.GoogleCredentials;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
@@ -24,8 +27,11 @@ import io.micrometer.core.instrument.Timer;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -49,9 +55,29 @@ public class FcmSender implements PushNotificationSender {
   private static final Logger logger = LoggerFactory.getLogger(FcmSender.class);
 
   public FcmSender(ExecutorService executor, String credentials) throws IOException {
+    this(executor, credentials, Map.of());
+  }
+
+  /**
+   * @param hostOverrides Tellomi: optional Google host -> relay base URI rewrites; empty keeps upstream behavior.
+   */
+  public FcmSender(ExecutorService executor, String credentials, Map<String, URI> hostOverrides) throws IOException {
     try (final ByteArrayInputStream credentialInputStream = new ByteArrayInputStream(credentials.getBytes(StandardCharsets.UTF_8))) {
-      FirebaseApp.initializeApp(FirebaseOptions.builder()
-          .setCredentials(GoogleCredentials.fromStream(credentialInputStream))
+      final FirebaseOptions.Builder optionsBuilder = FirebaseOptions.builder();
+      final GoogleCredentials googleCredentials;
+      if (hostOverrides == null || hostOverrides.isEmpty()) {
+        googleCredentials = GoogleCredentials.fromStream(credentialInputStream);
+      } else {
+        final Map<String, URI> normalized = new HashMap<>();
+        hostOverrides.forEach((host, uri) -> normalized.put(host.toLowerCase(), uri));
+        final HttpTransport transport = new HostRewritingHttpTransport(new NetHttpTransport(), normalized);
+        // Both the OAuth token exchange and the FCM send go through the rewriting transport.
+        googleCredentials = GoogleCredentials.fromStream(credentialInputStream, () -> transport);
+        optionsBuilder.setHttpTransport(transport);
+        logger.info("FCM host overrides enabled for {}", normalized.keySet());
+      }
+      FirebaseApp.initializeApp(optionsBuilder
+          .setCredentials(googleCredentials)
           .setThreadManager(new ThreadManager() {
             @Override
             protected ExecutorService getExecutor(final FirebaseApp app) {
